@@ -392,17 +392,6 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# Lightweight dropdown for available texts
-with st.expander("Browse Available Texts", expanded=False):
-    available = source_lookup
-    for tradition, titles in TEXT_COLLECTIONS.items():
-        present = sorted(t for t in titles if t in available)
-        if present:
-            st.write(f"**{tradition}** ({len(present)} texts)")
-            for title in present:
-                st.write(f"- {title}")
-    st.caption("Select texts in the Focus Sources section below to narrow your search.")
-
 # Source filter panel
 with st.expander("Focus Sources (Optional)", expanded=False):
     st.write("Select specific texts to focus your search:")
