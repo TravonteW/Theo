@@ -3,6 +3,7 @@
 Streamlit web interface for the PDF Q&A system.
 """
 
+import base64
 import streamlit as st
 import json
 import textwrap
@@ -57,6 +58,25 @@ TEXT_COLLECTIONS = {
     ],
 }
 
+MAX_CONVERSATIONS = 20
+QUICK_QUESTION_TEMPLATES = [
+    "Summarize the core teaching of the Sermon on the Mount.",
+    "Compare how the Bhagavad Gita and the Dhammapada describe duty.",
+    "What does the Talmud say about justice?",
+    "Explain the concept of mercy in the Quran."
+]
+
+TYPING_HTML = """
+<div class='message-bubble assistant'>
+    <div class='message-meta'><span>Theo</span><span>typing...</span></div>
+    <div class='typing-indicator'>
+        <span class='typing-dot'></span>
+        <span class='typing-dot'></span>
+        <span class='typing-dot'></span>
+    </div>
+</div>
+"""
+
 def format_title(name: str) -> str:
     return name.removesuffix(".pdf")
 
@@ -66,6 +86,80 @@ def normalize_title(filename: str) -> str:
 def sanitize_html(text: str) -> str:
     """Sanitize HTML content to prevent XSS attacks"""
     return html.escape(text)
+
+
+def safe_js_text(text: str) -> str:
+    return sanitize_html(text).replace('"', '&quot;').replace("'", "&#39;")
+
+
+def encode_copy_payload(text: str) -> str:
+    return base64.b64encode(text.encode('utf-8')).decode('ascii')
+
+
+def create_message(msg_type: str, content: str, citations=None, source_question: str | None = None):
+    """Create a structured chat message with metadata"""
+    citations = citations or []
+    st.session_state.message_counter += 1
+    return {
+        "id": f"{msg_type}-{st.session_state.message_counter}",
+        "type": msg_type,
+        "content": content,
+        "citations": citations,
+        "timestamp": datetime.now().isoformat(),
+        "source_question": source_question,
+    }
+
+
+def sync_message_counter():
+    """Ensure the message counter stays ahead of any stored messages."""
+    max_counter = st.session_state.message_counter
+    for conv in st.session_state.conversations:
+        for msg in conv.get("messages", []):
+            msg_id = str(msg.get("id", "") or "0")
+            try:
+                suffix = int(msg_id.split("-")[-1])
+                max_counter = max(max_counter, suffix)
+            except ValueError:
+                continue
+    st.session_state.message_counter = max_counter
+
+
+def format_timestamp(timestamp: str | None) -> str:
+    if not timestamp:
+        return ""
+    try:
+        dt = datetime.fromisoformat(timestamp)
+        return dt.strftime("%b %d - %H:%M")
+    except ValueError:
+        return timestamp or ""
+
+
+def run_answer_flow(question: str, add_question: bool = True, focus_sources=None):
+    """Shared helper to call the backend, append messages, and keep metadata."""
+    if not question:
+        return
+
+    history_messages = []
+    for msg in st.session_state.current_conversation[-6:]:
+        if msg["type"] == "question":
+            history_messages.append({"role": "user", "content": msg["content"]})
+        elif msg["type"] == "answer":
+            history_messages.append({"role": "assistant", "content": msg["content"]})
+
+    focus = focus_sources if focus_sources is not None else (st.session_state.selected_sources or None)
+    try:
+        result = answer(question, conversation=history_messages, focus_sources=focus)
+        st.session_state.last_error = None
+    except Exception as exc:
+        st.session_state.last_error = str(exc)
+        raise
+
+    if add_question:
+        st.session_state.current_conversation.append(create_message("question", question))
+
+    st.session_state.current_conversation.append(
+        create_message("answer", result["answer"], result.get("citations", []), source_question=question)
+    )
 
 def make_citations_clickable(text: str, answer_counter: int) -> str:
     """Convert citation numbers [1], [2] etc into clickable chips that scroll to citation cards"""
@@ -106,7 +200,7 @@ def generate_conversation_title(conversation):
         return tidy(questions[0])
     return f"{tidy(questions[0])} <-> {tidy(questions[1])}"
 
-def save_conversations_to_disk(conversations, max_conversations=50):
+def save_conversations_to_disk(conversations, max_conversations=MAX_CONVERSATIONS):
     """Save conversations to disk with size cap and rotation"""
     # Add timestamp to conversations if not present
     for conv in conversations:
@@ -142,6 +236,19 @@ def init_session_state():
         "conversation_counter": 1,
         "selected_sources": [],
         "rename_mode": None,  # stores the ID of conversation being renamed
+        "typing_indicator": False,
+        "conversation_search": "",
+        "selected_conversations": [],
+        "pending_prefill": "",
+        "question_input": "",
+        "message_counter": 0,
+        "user_settings": {
+            "show_timestamps": True,
+            "compact_mode": False,
+            "auto_scroll": True,
+        },
+        "last_error": None,
+        "pending_delete_confirmation": False,
     }
     for key, default_value in defaults.items():
         if key not in st.session_state:
@@ -170,125 +277,209 @@ st.set_page_config(
 st.markdown("""
 <style>
     :root {
-        --bg-color: #050505;
-        --panel-color: #101010;
-        --panel-border: #2b2b2b;
+        --page-bg: radial-gradient(circle at top, #1d1e25, #050505 65%);
+        --panel-bg: rgba(15, 17, 25, 0.95);
+        --panel-border: #272b3c;
         --accent: #4cc3ff;
-        --accent-soft: #ffb347;
+        --accent-2: #f7e1a1;
         --text-color: #f5f5f5;
-        --text-muted: #c1c1c1;
+        --text-muted: #b0b7c8;
+        --danger: #ff6b6b;
     }
 
     .stApp {
-        background: var(--bg-color);
+        background: var(--page-bg);
         color: var(--text-color);
         font-family: 'Inter','Segoe UI',sans-serif;
     }
 
-    body, .stMarkdown, .stText, .stTextInput label, .stCaption, .sidebar-card, .answer-card, .citation-card {
+    body, .stMarkdown, .stText, .stTextInput label, .stCaption {
         color: var(--text-color) !important;
     }
 
     .stApp > main .block-container {
-        max-width: 1100px;
+        max-width: 1150px;
         padding: 2.5rem 2rem 3.5rem;
         gap: 1.5rem;
-        background: transparent;
     }
 
     .hero-title h1 {
-        font-size: 2.5rem;
+        font-size: 2.8rem;
         margin-bottom: 0.2rem;
+        background: linear-gradient(90deg, #f7e1a1, #4cc3ff);
+        -webkit-background-clip: text;
+        -webkit-text-fill-color: transparent;
     }
 
     .hero-title .hero-subtitle {
         font-size: 1.1rem;
         font-weight: 500;
-        margin-bottom: 1.5rem;
+        margin-bottom: 1.25rem;
         color: var(--text-muted);
+    }
+
+    .quick-chip {
+        display: inline-flex;
+        align-items: center;
+        gap: 0.35rem;
+        padding: 0.4rem 0.85rem;
+        margin: 0.25rem 0.35rem 0.35rem 0;
+        border-radius: 999px;
+        border: 1px solid rgba(255,255,255,0.15);
+        background: rgba(255,255,255,0.03);
+        color: var(--text-color);
+        font-size: 0.9rem;
+        cursor: pointer;
+        transition: all 0.2s ease;
+    }
+
+    .quick-chip:hover {
+        border-color: var(--accent);
+        box-shadow: 0 0 12px rgba(76,195,255,0.25);
     }
 
     .streamlit-expanderHeader {
         background: rgba(255,255,255,0.02) !important;
-        border-radius: 8px !important;
+        border-radius: 10px !important;
         border: 1px solid var(--panel-border) !important;
-        padding: 0.5rem !important;
-        margin-bottom: 0.25rem !important;
+        padding: 0.5rem 0.75rem !important;
         color: var(--text-color) !important;
     }
 
     div[data-testid="stExpander"] > div[data-testid="stExpanderContent"] {
-        background: var(--panel-color);
+        background: var(--panel-bg);
         border: 1px solid var(--panel-border);
-        border-radius: 14px;
+        border-radius: 16px;
         padding: 1.2rem 1.35rem;
-        box-shadow: 0 10px 35px rgba(0,0,0,0.45);
+        box-shadow: 0 18px 45px rgba(0,0,0,0.45);
     }
 
-    .stTextInput > div > div,
-    textarea {
-        background: rgba(255,255,255,0.03);
-        color: var(--text-color);
-        border-radius: 12px;
+    .source-counter {
+        font-size: 0.85rem;
+        color: var(--text-muted);
+        margin-top: 0.4rem;
+    }
+
+    .stTextInput > div > div {
+        border-radius: 14px;
+        padding: 0.65rem 0.85rem;
+        background: rgba(0,0,0,0.6);
         border: 1px solid var(--panel-border);
-        padding: 0.6rem 0.85rem;
     }
 
-    .stTextInput > div > div input {
-        color: var(--text-color);
+    .stTextInput input {
+        color: var(--text-color) !important;
     }
 
     .stButton button {
-        padding: 0.7rem 1rem;
+        padding: 0.65rem 1rem;
         min-height: 42px;
-        border-radius: 12px;
-        background: linear-gradient(90deg, #1a1a1a, #252525);
+        border-radius: 999px;
+        border: 1px solid rgba(255,255,255,0.1);
+        background: linear-gradient(120deg, rgba(255,255,255,0.06), rgba(255,255,255,0.02));
         color: var(--text-color);
-        border: 1px solid #3a3a3a;
-        transition: border-color 0.2s ease, color 0.2s ease;
+        transition: border-color 0.2s ease, transform 0.2s ease;
     }
 
     .stButton button:hover {
         border-color: var(--accent);
+        transform: translateY(-1px);
+    }
+
+    .chat-stream {
+        background: rgba(0,0,0,0.15);
+        border-radius: 18px;
+        padding: 1.25rem;
+        border: 1px solid rgba(255,255,255,0.05);
+        box-shadow: inset 0 0 0 1px rgba(255,255,255,0.02);
+        width: 100%;
+        box-sizing: border-box;
+    }
+
+    .message-bubble {
+        position: relative;
+        padding: 1rem 1.25rem;
+        border-radius: 18px;
+        margin-bottom: 0.5rem;
+        border: 1px solid rgba(255,255,255,0.08);
+        box-shadow: 0 10px 32px rgba(0,0,0,0.35);
+        width: 100%;
+        box-sizing: border-box;
+    }
+
+    .message-bubble.user {
+        background: rgba(76,195,255,0.08);
+        border-color: rgba(76,195,255,0.3);
+    }
+
+    .message-bubble.assistant {
+        background: rgba(255,255,255,0.02);
+    }
+
+    .message-meta {
+        font-size: 0.8rem;
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+        color: var(--text-muted);
+        margin-bottom: 0.35rem;
+        display: flex;
+        justify-content: space-between;
+        flex-wrap: wrap;
+    }
+
+    .action-btn.copy {
+        background: linear-gradient(120deg, rgba(255,255,255,0.06), rgba(255,255,255,0.02));
+        border: 1px solid rgba(255,255,255,0.12);
+        color: var(--text-color);
+        border-radius: 999px;
+        padding: 0.4rem 1.4rem;
+        cursor: pointer;
+        font-size: 0.85rem;
+        text-align: center;
+        min-width: 150px;
+    }
+
+    .action-btn.copy:hover,
+    .action-btn.copy.copied {
+        border-color: var(--accent);
         color: var(--accent);
     }
 
-    .chat-message {
-        background: var(--panel-color);
-        padding: 1rem;
-        border-radius: 12px;
-        margin: 0.5rem 0;
-        border: 1px solid var(--panel-border);
-        box-shadow: 0 6px 20px rgba(0,0,0,0.45);
+    .typing-indicator {
+        display: inline-flex;
+        align-items: center;
+        gap: 0.3rem;
     }
 
-    .chat-question {
-        border: 1px solid var(--accent);
-        background: #0f1a1e;
+    .typing-dot {
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        background: var(--accent);
+        animation: pulse 1s infinite ease-in-out;
     }
 
-    .answer-card {
-        background: var(--panel-color);
-        padding: 1.5rem;
-        border-radius: 12px;
-        border: 1px solid var(--panel-border);
-        box-shadow: 0 6px 24px rgba(0,0,0,0.6);
+    .typing-dot:nth-child(2) { animation-delay: 0.15s; }
+    .typing-dot:nth-child(3) { animation-delay: 0.3s; }
+
+    @keyframes pulse {
+        0%, 80%, 100% { transform: scale(0.8); opacity: 0.4; }
+        40% { transform: scale(1); opacity: 1; }
     }
 
     .citation-card {
-        background: #0b0b0b;
+        background: rgba(255,255,255,0.02);
         padding: 1rem;
         border-radius: 10px;
-        border: 1px solid #272727;
+        border: 1px solid rgba(255,255,255,0.08);
         margin: 0.6rem 0;
         display: flex;
-        gap: 0.85rem;
-        box-shadow: inset 0 0 0 1px rgba(255,255,255,0.02);
+        gap: 0.75rem;
     }
 
     .citation-badge {
-        background: var(--accent);
-        color: #041016;
+        background: var(--accent-2);
+        color: #111;
         border-radius: 50%;
         width: 28px;
         height: 28px;
@@ -296,56 +487,69 @@ st.markdown("""
         align-items: center;
         justify-content: center;
         font-weight: 700;
-        flex-shrink: 0;
     }
 
-    .citation-title {
-        font-weight: 600;
-        color: var(--text-color);
-        margin: 0 0 0.35rem 0;
-        font-size: 0.95rem;
+    section[data-testid="stSidebar"] {
+        background: rgba(8,9,13,0.95);
+        border-right: 1px solid rgba(255,255,255,0.05);
     }
 
-    .citation-snippet {
-        color: var(--text-muted);
-        margin: 0;
-        font-size: 0.9rem;
-        line-height: 1.5;
-    }
-
-    .copy-buttons {
-        margin-top: 0.6rem;
-        display: flex;
-        gap: 0.5rem;
-    }
-
-    .copy-btn {
-        background: transparent;
-        border: 1px solid var(--accent);
-        color: var(--accent);
-        border-radius: 6px;
-        padding: 0.25rem 0.6rem;
-        font-size: 0.8rem;
-        cursor: pointer;
-        transition: background 0.2s ease;
-    }
-
-    .copy-btn:hover {
-        background: rgba(76,195,255,0.15);
-    }
-
-    .stSidebar,
-    .stSidebar > div {
-        background: #050505;
-        color: var(--text-color);
-    }
-
-    .stSidebar .stButton button {
+    .conversation-card {
+        background: rgba(255,255,255,0.03);
+        border: 1px solid rgba(255,255,255,0.08);
+        border-radius: 14px;
+        padding: 0.75rem;
+        margin-bottom: 0.6rem;
+        transition: border-color 0.2s ease;
         width: 100%;
     }
 
-    .stForm {
-        margin-bottom: 1.25rem;
+    .conversation-card button {
+        width: 100%;
+    }
+
+    .conversation-card:hover {
+        border-color: var(--accent);
+    }
+
+    .conversation-meta {
+        font-size: 0.8rem;
+        color: var(--text-muted);
+    }
+
+    .conversation-row {
+        display: flex;
+        gap: 0.4rem;
+        align-items: center;
+    }
+
+    .conversation-search input {
+        background: rgba(0,0,0,0.6) !important;
+        border-radius: 999px !important;
+    }
+
+    .danger-zone {
+        border: 1px solid rgba(255,107,107,0.3);
+        background: rgba(255,107,107,0.1);
+        border-radius: 12px;
+        padding: 0.75rem;
+    }
+
+    .settings-toggle label {
+        font-size: 0.9rem;
+    }
+
+    @media (max-width: 768px) {
+        .chat-stream {
+            padding: 1rem;
+        }
+        .message-bubble {
+            padding: 0.85rem;
+        }
+        .quick-chip {
+            width: 100%;
+            justify-content: center;
+        }
     }
 </style>
 
@@ -378,7 +582,8 @@ init_session_state()
 # Load conversations from disk on startup
 if not st.session_state.conversations:
     st.session_state.conversations = load_conversations_from_disk()
-source_lookup = load_available_sources()
+
+sync_message_counter()
 
 
 # Hero section with lightweight dropdown menu
@@ -392,10 +597,22 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+st.markdown("##### Quick question templates")
+template_cols = st.columns(2)
+for idx, template in enumerate(QUICK_QUESTION_TEMPLATES):
+    col = template_cols[idx % 2]
+    with col:
+        if st.button(f"Try: {template}", key=f"quick_template_{idx}"):
+            st.session_state.pending_prefill = template
+
+if st.session_state.pending_prefill:
+    st.session_state.question_input = st.session_state.pending_prefill
+    st.session_state.pending_prefill = ""
+
 # Source filter panel
 with st.expander("Focus Sources (Optional)", expanded=False):
     st.write("Select specific texts to focus your search:")
-    available_sources = list(source_lookup.keys())
+    available_sources = list(load_available_sources())
 
     # Group sources by tradition for easier selection
     col1, col2 = st.columns(2)
@@ -428,40 +645,80 @@ with st.expander("Focus Sources (Optional)", expanded=False):
             st.session_state.selected_sources = []
             st.rerun()
 
+    st.caption(f"{len(st.session_state.selected_sources)} selected - {len(available_sources)} available")
+
 # Main chat interface
 main_col = st.container()
 
 with main_col:
-    # Display current conversation
-    if st.session_state.current_conversation:
-        st.markdown("#### Current Conversation")
-        answer_counter = 0
-        for msg in st.session_state.current_conversation:
-            if msg["type"] == "question":
-                st.markdown(
-                    f"<div class='chat-message chat-question'><strong>You:</strong> {sanitize_html(msg['content'])}</div>",
-                    unsafe_allow_html=True
-                )
-            else:
-                answer_counter += 1
-                # Make citations clickable in the answer
-                clickable_content = make_citations_clickable(sanitize_html(msg['content']), answer_counter)
-                st.markdown(
-                    f"<div class='chat-message'><strong>Theo:</strong> {clickable_content}</div>",
-                    unsafe_allow_html=True
-                )
+    conversation = st.session_state.current_conversation
+    settings = st.session_state.user_settings
+    st.markdown("#### Conversation")
+    chat_stream = st.container()
+    answer_counter = 0
 
-                # Show citations if available
+    with chat_stream:
+        st.markdown("<div class='chat-stream'>", unsafe_allow_html=True)
+        for idx, msg in enumerate(conversation):
+            msg_id = msg.get("id") or f"{msg['type']}-{idx}"
+            role = "You" if msg["type"] == "question" else "Theo"
+            timestamp = format_timestamp(msg.get("timestamp")) if settings.get("show_timestamps", True) else ""
+            bubble_class = "user" if msg["type"] == "question" else "assistant"
+            body_html = sanitize_html(msg["content"])
+
+            if msg["type"] == "answer":
+                answer_counter += 1
+                body_html = make_citations_clickable(body_html, answer_counter)
+
+            meta = f"<span>{role}</span>"
+            if timestamp:
+                meta += f"<span>{timestamp}</span>"
+
+            st.markdown(
+                f"""
+                <div class='message-bubble {bubble_class}' id='{msg_id}'>
+                    <div class='message-meta'>{meta}</div>
+                    <div class='message-body'>{body_html}</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+            if msg["type"] == "answer":
+                actions = st.columns([1, 1])
+                with actions[0]:
+                    copy_payload = encode_copy_payload(msg['content'])
+                    st.markdown(
+                        f"<button class='action-btn copy' data-copy-b64='{copy_payload}'>Copy</button>",
+                        unsafe_allow_html=True,
+                    )
+                with actions[1]:
+                    is_latest_answer = idx == len(conversation) - 1
+                    if is_latest_answer:
+                        if st.button("Regenerate", key=f"regen_{msg_id}", use_container_width=True):
+                            conversation.pop()
+                            regen_placeholder = st.empty()
+                            regen_placeholder.markdown(TYPING_HTML, unsafe_allow_html=True)
+                            try:
+                                prior_question = msg.get("source_question")
+                                if not prior_question and idx > 0 and conversation[idx - 1]["type"] == "question":
+                                    prior_question = conversation[idx - 1]["content"]
+                                run_answer_flow(prior_question or "", add_question=False)
+                            finally:
+                                regen_placeholder.empty()
+                            st.rerun()
+                    else:
+                        st.caption("Regenerate latest answer only")
+
                 if msg.get("citations"):
-                    expander_label = "Citations" + (" " * answer_counter)
-                    with st.expander(expander_label, expanded=False):
+                    exp_label = f"Citations - Answer {answer_counter}"
+                    with st.expander(exp_label, expanded=False):
                         for citation in msg["citations"]:
                             label = citation["index"]
                             display_name = format_title(citation["pdf"])
                             citation_id = f"citation-{answer_counter}-{label}"
-                            # Prepare citation text for copying - fully sanitized
                             citation_text_raw = f"{display_name}, Page {citation['page']}"
-                            safe_citation_js = sanitize_html(citation_text_raw).replace('"', '&quot;').replace("'", "&#39;")
+                            safe_citation_js = safe_js_text(citation_text_raw)
                             st.markdown(
                                 f"""
                                 <div class='citation-card' id='{sanitize_html(citation_id)}'>
@@ -478,50 +735,62 @@ with main_col:
                                 unsafe_allow_html=True,
                             )
 
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    typing_placeholder = st.empty()
+
+    if st.session_state.last_error:
+        st.error(st.session_state.last_error)
+
     # Input form
     with st.form("chat_form", clear_on_submit=True):
-        question = st.text_input("Continue the conversation...", placeholder="Ask a follow-up question or start a new topic")
+        question = st.text_input(
+            "Continue the conversation...",
+            key="question_input",
+            placeholder="Ask a follow-up question or start a new topic",
+        )
         submitted = st.form_submit_button("Send")
 
     # Process form submission
     if submitted and question:
-        with st.spinner("Thinking..."):
+        typing_placeholder.markdown(TYPING_HTML, unsafe_allow_html=True)
+        with st.spinner("Theo is composing a reply..."):
             try:
-                # Derive the history that matches the new schema
-                history_messages = []
-                for msg in st.session_state.current_conversation[-6:]:
-                    if msg["type"] == "question":
-                        history_messages.append({"role": "user", "content": msg["content"]})
-                    elif msg["type"] == "answer":
-                        history_messages.append({"role": "assistant", "content": msg["content"]})
+                run_answer_flow(question)
+            finally:
+                typing_placeholder.empty()
 
-                # Pass selected sources for focused retrieval
-                mapped_focus = []
-                for name in st.session_state.selected_sources:
-                    actual = source_lookup.get(name, name)
-                    if actual not in mapped_focus:
-                        mapped_focus.append(actual)
-                focus_sources = mapped_focus if mapped_focus else None
-                result = answer(question, conversation=history_messages, focus_sources=focus_sources)
-
-                # Add question to current conversation
-                st.session_state.current_conversation.append({
-                    "type": "question",
-                    "content": question
-                })
-
-                # Add answer to current conversation
-                st.session_state.current_conversation.append({
-                    "type": "answer",
-                    "content": result["answer"],
-                    "citations": result.get("citations", [])
-                })
-
-                st.rerun()
-            except Exception as e:
-                st.error(f"Error: {str(e)}")
-                if "not found" in str(e).lower():
-                    st.info("Please make sure to run ingest.py and embed.py before asking questions.")
+auto_scroll_flag = "true" if st.session_state.user_settings.get("auto_scroll", True) else "false"
+st.markdown(
+    f"""
+    <div id="chat-bottom"></div>
+    <script>
+        const autoScrollEnabled = {auto_scroll_flag};
+        if (autoScrollEnabled) {{
+            setTimeout(() => {{
+                const bottom = document.getElementById('chat-bottom');
+                if (bottom) bottom.scrollIntoView({{behavior: 'smooth', block: 'end'}});
+            }}, 120);
+        }}
+        document.querySelectorAll('.action-btn.copy').forEach(btn => {{
+            btn.addEventListener('click', () => {{
+                const payload = btn.getAttribute('data-copy-b64');
+                if (payload) {{
+                    try {{
+                        const text = atob(payload);
+                        navigator.clipboard.writeText(text);
+                        btn.classList.add('copied');
+                        setTimeout(() => btn.classList.remove('copied'), 800);
+                    }} catch (err) {{
+                        console.error('Copy failed', err);
+                    }}
+                }}
+            }});
+        }});
+    </script>
+    """,
+    unsafe_allow_html=True,
+)
 
 # Footer
 st.markdown("---")
@@ -530,53 +799,107 @@ st.caption("Theo - Powered by OpenAI API and FAISS")
 # Sidebar conversations
 with st.sidebar:
     st.markdown("### Conversations")
-    if st.session_state.conversations:
-        for conv in reversed(st.session_state.conversations[-5:]):
-            conv_id = conv['id']
+    search_query = st.text_input(
+        "Search conversations",
+        key="conversation_search",
+        placeholder="Search by title or content",
+    ).strip().lower()
 
-            # Check if this conversation is in rename mode
-            if st.session_state.rename_mode == conv_id:
-                # Show rename input
+    def matches_query(conv):
+        if not search_query:
+            return True
+        title_match = search_query in conv.get("title", "").lower()
+        if title_match:
+            return True
+        for entry in conv.get("messages", []):
+            if search_query in entry.get("content", "").lower():
+                return True
+        return False
+
+    matching_conversations = [conv for conv in st.session_state.conversations if matches_query(conv)]
+
+    if matching_conversations:
+        for conv in reversed(matching_conversations[-MAX_CONVERSATIONS:]):
+            conv_id = conv.get('id', conv.get('title', 'untitled'))
+            conv_key = str(conv_id)
+            message_total = len(conv.get("messages", []))
+            timestamp_label = format_timestamp(conv.get("timestamp")) or "Unsaved draft"
+
+            select_key = f"select_{conv_key}"
+            checked = st.checkbox(
+                "Select",
+                key=select_key,
+                value=conv_key in st.session_state.selected_conversations,
+                help="Select for batch delete",
+            )
+            if checked and conv_key not in st.session_state.selected_conversations:
+                st.session_state.selected_conversations.append(conv_key)
+            elif not checked and conv_key in st.session_state.selected_conversations:
+                st.session_state.selected_conversations.remove(conv_key)
+
+            title_text = conv.get('title', 'Conversation') or 'Conversation'
+            st.markdown(f"**{sanitize_html(title_text)}**")
+            st.caption(f"{timestamp_label} - {message_total} messages")
+
+            if st.session_state.rename_mode == conv_key:
                 new_title = st.text_input(
-                    "Rename:",
+                    "Rename conversation",
                     value=conv['title'],
-                    key=f"rename_input_{conv_id}"
+                    key=f"rename_input_{conv_key}"
                 )
-                col1, col2 = st.columns(2)
-                with col1:
-                    if st.button("Save", key=f"save_rename_{conv_id}", help="Save"):
-                        # Update conversation title
-                        for i, c in enumerate(st.session_state.conversations):
-                            if c['id'] == conv_id:
-                                st.session_state.conversations[i]['title'] = new_title
-                                break
-                        st.session_state.rename_mode = None
-                        st.rerun()
-                with col2:
-                    if st.button("Cancel", key=f"cancel_rename_{conv_id}", help="Cancel"):
-                        st.session_state.rename_mode = None
-                        st.rerun()
+                if st.button("Save name", key=f"save_{conv_key}", use_container_width=True):
+                    conv['title'] = new_title
+                    st.session_state.rename_mode = None
+                    save_conversations_to_disk(st.session_state.conversations)
+                if st.button("Cancel rename", key=f"cancel_{conv_key}", use_container_width=True):
+                    st.session_state.rename_mode = None
             else:
-                # Show normal conversation with controls
-                col1, col2, col3 = st.columns([4, 1, 1])
-                with col1:
-                    if st.button(f"Open {conv['title']}", key=f"conv_{conv_id}"):
-                        st.session_state.current_conversation = conv["messages"].copy()
-                        st.rerun()
-                with col2:
-                    if st.button("Rename", key=f"edit_{conv_id}", help="Rename"):
-                        st.session_state.rename_mode = conv_id
-                        st.rerun()
-                with col3:
-                    if st.button("Delete", key=f"delete_{conv_id}", help="Delete"):
-                        st.session_state.conversations = [
-                            c for c in st.session_state.conversations if c['id'] != conv_id
-                        ]
-                        st.rerun()
-    else:
-        st.markdown("*No previous conversations*")
+                if st.button(
+                    "Open conversation",
+                    key=f"open_{conv_key}",
+                    use_container_width=True,
+                ):
+                    st.session_state.current_conversation = conv["messages"].copy()
+                    st.rerun()
 
-    if st.button("Start New Conversation", key="sidebar_start_new"):
+                if st.button("Rename", key=f"rename_{conv_key}", use_container_width=True):
+                    st.session_state.rename_mode = conv_key
+
+                if st.button("Delete", key=f"delete_{conv_key}", use_container_width=True):
+                    st.session_state.conversations = [
+                        c for c in st.session_state.conversations if str(c.get('id', c.get('title'))) != conv_key
+                    ]
+                    if conv_key in st.session_state.selected_conversations:
+                        st.session_state.selected_conversations.remove(conv_key)
+                    save_conversations_to_disk(st.session_state.conversations)
+                    st.rerun()
+
+            st.markdown("---")
+    else:
+        st.markdown("*No conversations yet*")
+
+    if st.session_state.selected_conversations:
+        if st.button("Delete selected conversations", key="delete_selected"):
+            st.session_state.pending_delete_confirmation = True
+
+    if st.session_state.pending_delete_confirmation:
+        st.warning("This action permanently deletes the selected conversations.")
+        confirm_col, cancel_col = st.columns(2)
+        with confirm_col:
+            if st.button("Confirm delete", key="confirm_batch_delete"):
+                st.session_state.conversations = [
+                    conv for conv in st.session_state.conversations
+                    if str(conv.get('id', conv.get('title'))) not in st.session_state.selected_conversations
+                ]
+                st.session_state.selected_conversations = []
+                st.session_state.pending_delete_confirmation = False
+                save_conversations_to_disk(st.session_state.conversations)
+                st.rerun()
+        with cancel_col:
+            if st.button("Cancel", key="cancel_batch_delete"):
+                st.session_state.pending_delete_confirmation = False
+
+    if st.button("Start New Conversation", key="sidebar_start_new", use_container_width=True):
         if st.session_state.current_conversation:
             from datetime import datetime
             title = generate_conversation_title(st.session_state.current_conversation)
@@ -587,8 +910,14 @@ with st.sidebar:
                 "timestamp": datetime.now().isoformat()
             }
             st.session_state.conversations.append(new_conversation)
+            st.session_state.conversations = st.session_state.conversations[-MAX_CONVERSATIONS:]
             st.session_state.conversation_counter += 1
-            # Save to disk with rotation
             save_conversations_to_disk(st.session_state.conversations)
         st.session_state.current_conversation = []
         st.rerun()
+
+    with st.expander("Settings & Preferences"):
+        settings = st.session_state.user_settings
+        settings["show_timestamps"] = st.checkbox("Show message timestamps", value=settings.get("show_timestamps", True))
+        settings["auto_scroll"] = st.checkbox("Auto-scroll to newest message", value=settings.get("auto_scroll", True))
+        settings["compact_mode"] = st.checkbox("Compact layout", value=settings.get("compact_mode", False))
