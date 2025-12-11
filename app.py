@@ -96,6 +96,77 @@ def encode_copy_payload(text: str) -> str:
     return base64.b64encode(text.encode('utf-8')).decode('ascii')
 
 
+def ensure_conversation_ids():
+    """Guarantee each saved conversation has a unique numeric ID."""
+    next_id = st.session_state.conversation_counter
+    updated = False
+    for conv in st.session_state.conversations:
+        if 'id' not in conv:
+            conv['id'] = next_id
+            next_id += 1
+            updated = True
+    if updated or next_id > st.session_state.conversation_counter:
+        st.session_state.conversation_counter = next_id
+
+
+def find_conversation_index(conv_id):
+    for idx, conv in enumerate(st.session_state.conversations):
+        if str(conv.get('id')) == str(conv_id):
+            return idx
+    return None
+
+
+def ensure_active_conversation():
+    """Create a placeholder conversation if none is active."""
+    if st.session_state.active_conversation_id is None:
+        new_id = st.session_state.conversation_counter
+        st.session_state.conversation_counter += 1
+        placeholder = {
+            "id": new_id,
+            "title": "New conversation",
+            "messages": [],
+            "timestamp": datetime.now().isoformat()
+        }
+        st.session_state.conversations.append(placeholder)
+        st.session_state.active_conversation_id = new_id
+    return st.session_state.active_conversation_id
+
+
+def persist_current_conversation():
+    """Sync the in-progress conversation back into the sidebar list."""
+    if not st.session_state.current_conversation:
+        return
+    active_id = ensure_active_conversation()
+    idx = find_conversation_index(active_id)
+    if idx is None:
+        return
+    st.session_state.conversations[idx]["messages"] = st.session_state.current_conversation.copy()
+    st.session_state.conversations[idx]["title"] = generate_conversation_title(st.session_state.current_conversation)
+    st.session_state.conversations[idx]["timestamp"] = datetime.now().isoformat()
+    st.session_state.conversations = st.session_state.conversations[-MAX_CONVERSATIONS:]
+    save_conversations_to_disk(st.session_state.conversations)
+
+
+def ensure_active_conversation_loaded():
+    active_id = st.session_state.active_conversation_id
+    if active_id is None:
+        return
+    idx = find_conversation_index(active_id)
+    if idx is None:
+        st.session_state.active_conversation_id = None
+        st.session_state.current_conversation = []
+    else:
+        st.session_state.current_conversation = st.session_state.conversations[idx]["messages"].copy()
+
+
+def remove_conversation(base_id):
+    idx = find_conversation_index(base_id)
+    if idx is None:
+        return False
+    st.session_state.conversations.pop(idx)
+    return True
+
+
 def create_message(msg_type: str, content: str, citations=None, source_question: str | None = None):
     """Create a structured chat message with metadata"""
     citations = citations or []
@@ -138,6 +209,7 @@ def run_answer_flow(question: str, add_question: bool = True, focus_sources=None
     """Shared helper to call the backend, append messages, and keep metadata."""
     if not question:
         return
+    ensure_active_conversation()
 
     history_messages = []
     for msg in st.session_state.current_conversation[-6:]:
@@ -160,6 +232,7 @@ def run_answer_flow(question: str, add_question: bool = True, focus_sources=None
     st.session_state.current_conversation.append(
         create_message("answer", result["answer"], result.get("citations", []), source_question=question)
     )
+    persist_current_conversation()
 
 def make_citations_clickable(text: str, answer_counter: int) -> str:
     """Convert citation numbers [1], [2] etc into clickable chips that scroll to citation cards"""
@@ -241,7 +314,9 @@ def init_session_state():
         "selected_conversations": [],
         "pending_prefill": "",
         "question_input": "",
+        "question_needs_reset": False,
         "message_counter": 0,
+        "active_conversation_id": None,
         "user_settings": {
             "show_timestamps": True,
             "compact_mode": False,
@@ -584,6 +659,9 @@ if not st.session_state.conversations:
     st.session_state.conversations = load_conversations_from_disk()
 
 sync_message_counter()
+ensure_conversation_ids()
+st.session_state.selected_conversations = [str(x) for x in st.session_state.selected_conversations]
+ensure_active_conversation_loaded()
 
 
 # Hero section with lightweight dropdown menu
@@ -743,6 +821,10 @@ with main_col:
         st.error(st.session_state.last_error)
 
     # Input form
+    if st.session_state.get("question_needs_reset"):
+        st.session_state.question_input = ""
+        st.session_state.question_needs_reset = False
+
     with st.form("chat_form", clear_on_submit=True):
         question = st.text_input(
             "Continue the conversation...",
@@ -759,6 +841,8 @@ with main_col:
                 run_answer_flow(question)
             finally:
                 typing_placeholder.empty()
+        st.session_state.question_needs_reset = True
+        st.rerun()
 
 auto_scroll_flag = "true" if st.session_state.user_settings.get("auto_scroll", True) else "false"
 st.markdown(
@@ -819,33 +903,34 @@ with st.sidebar:
     matching_conversations = [conv for conv in st.session_state.conversations if matches_query(conv)]
 
     if matching_conversations:
-        for conv in reversed(matching_conversations[-MAX_CONVERSATIONS:]):
-            conv_id = conv.get('id', conv.get('title', 'untitled'))
-            conv_key = str(conv_id)
+        for idx, conv in enumerate(reversed(matching_conversations[-MAX_CONVERSATIONS:])):
+            base_id = str(conv.get('id'))
+            widget_suffix = f"{base_id}_{idx}"
+            conv_key = widget_suffix
             message_total = len(conv.get("messages", []))
             timestamp_label = format_timestamp(conv.get("timestamp")) or "Unsaved draft"
 
-            select_key = f"select_{conv_key}"
+            select_key = f"select_{widget_suffix}"
             checked = st.checkbox(
                 "Select",
                 key=select_key,
-                value=conv_key in st.session_state.selected_conversations,
+                value=base_id in st.session_state.selected_conversations,
                 help="Select for batch delete",
             )
-            if checked and conv_key not in st.session_state.selected_conversations:
-                st.session_state.selected_conversations.append(conv_key)
-            elif not checked and conv_key in st.session_state.selected_conversations:
-                st.session_state.selected_conversations.remove(conv_key)
+            if checked and base_id not in st.session_state.selected_conversations:
+                st.session_state.selected_conversations.append(base_id)
+            elif not checked and base_id in st.session_state.selected_conversations:
+                st.session_state.selected_conversations.remove(base_id)
 
             title_text = conv.get('title', 'Conversation') or 'Conversation'
             st.markdown(f"**{sanitize_html(title_text)}**")
             st.caption(f"{timestamp_label} - {message_total} messages")
 
-            if st.session_state.rename_mode == conv_key:
+            if st.session_state.rename_mode == base_id:
                 new_title = st.text_input(
                     "Rename conversation",
                     value=conv['title'],
-                    key=f"rename_input_{conv_key}"
+                    key=f"rename_input_{widget_suffix}"
                 )
                 if st.button("Save name", key=f"save_{conv_key}", use_container_width=True):
                     conv['title'] = new_title
@@ -860,17 +945,19 @@ with st.sidebar:
                     use_container_width=True,
                 ):
                     st.session_state.current_conversation = conv["messages"].copy()
+                    st.session_state.active_conversation_id = conv.get('id')
                     st.rerun()
 
                 if st.button("Rename", key=f"rename_{conv_key}", use_container_width=True):
-                    st.session_state.rename_mode = conv_key
+                    st.session_state.rename_mode = base_id
 
                 if st.button("Delete", key=f"delete_{conv_key}", use_container_width=True):
-                    st.session_state.conversations = [
-                        c for c in st.session_state.conversations if str(c.get('id', c.get('title'))) != conv_key
-                    ]
-                    if conv_key in st.session_state.selected_conversations:
-                        st.session_state.selected_conversations.remove(conv_key)
+                    removed = remove_conversation(base_id)
+                    if base_id in st.session_state.selected_conversations:
+                        st.session_state.selected_conversations.remove(base_id)
+                    if removed and st.session_state.active_conversation_id is not None and str(st.session_state.active_conversation_id) == base_id:
+                        st.session_state.active_conversation_id = None
+                        st.session_state.current_conversation = []
                     save_conversations_to_disk(st.session_state.conversations)
                     st.rerun()
 
@@ -887,10 +974,14 @@ with st.sidebar:
         confirm_col, cancel_col = st.columns(2)
         with confirm_col:
             if st.button("Confirm delete", key="confirm_batch_delete"):
+                ids_to_remove = set(st.session_state.selected_conversations)
                 st.session_state.conversations = [
                     conv for conv in st.session_state.conversations
-                    if str(conv.get('id', conv.get('title'))) not in st.session_state.selected_conversations
+                    if str(conv.get('id')) not in ids_to_remove
                 ]
+                if st.session_state.active_conversation_id and str(st.session_state.active_conversation_id) in ids_to_remove:
+                    st.session_state.active_conversation_id = None
+                    st.session_state.current_conversation = []
                 st.session_state.selected_conversations = []
                 st.session_state.pending_delete_confirmation = False
                 save_conversations_to_disk(st.session_state.conversations)
@@ -900,20 +991,17 @@ with st.sidebar:
                 st.session_state.pending_delete_confirmation = False
 
     if st.button("Start New Conversation", key="sidebar_start_new", use_container_width=True):
-        if st.session_state.current_conversation:
-            from datetime import datetime
-            title = generate_conversation_title(st.session_state.current_conversation)
-            new_conversation = {
-                "id": st.session_state.conversation_counter,
-                "title": title,
-                "messages": st.session_state.current_conversation.copy(),
-                "timestamp": datetime.now().isoformat()
-            }
-            st.session_state.conversations.append(new_conversation)
-            st.session_state.conversations = st.session_state.conversations[-MAX_CONVERSATIONS:]
-            st.session_state.conversation_counter += 1
-            save_conversations_to_disk(st.session_state.conversations)
+        if st.session_state.active_conversation_id is not None:
+            idx = find_conversation_index(st.session_state.active_conversation_id)
+            if idx is not None and not st.session_state.conversations[idx].get("messages"):
+                st.session_state.conversations.pop(idx)
+                save_conversations_to_disk(st.session_state.conversations)
         st.session_state.current_conversation = []
+        st.session_state.active_conversation_id = None
+        st.session_state.rename_mode = None
+        st.session_state.pending_prefill = ""
+        st.session_state.last_error = None
+        st.session_state.question_needs_reset = True
         st.rerun()
 
     with st.expander("Settings & Preferences"):
