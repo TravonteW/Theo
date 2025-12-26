@@ -97,16 +97,78 @@ def encode_copy_payload(text: str) -> str:
 
 
 def ensure_conversation_ids():
-    """Guarantee each saved conversation has a unique numeric ID."""
-    next_id = st.session_state.conversation_counter
+    """Guarantee each saved conversation has a unique numeric ID and a safe counter."""
+
+    def _parse_id(value):
+        try:
+            return int(str(value))
+        except (TypeError, ValueError):
+            return None
+
     updated = False
-    for conv in st.session_state.conversations:
-        if 'id' not in conv:
-            conv['id'] = next_id
+    conversations = st.session_state.conversations
+
+    # If duplicate IDs exist, keep the "best" conversation on the original ID and re-ID the rest.
+    groups: Dict[int, List[Dict]] = {}
+    for conv in conversations:
+        cid = _parse_id(conv.get("id"))
+        if cid is not None:
+            groups.setdefault(cid, []).append(conv)
+
+    for cid, group in groups.items():
+        if len(group) <= 1:
+            continue
+
+        def _score(c: Dict):
+            messages = c.get("messages") or []
+            ts = c.get("timestamp") or ""
+            return (len(messages), ts)
+
+        group_sorted = sorted(group, key=_score, reverse=True)
+        # Keep the winner's ID, clear IDs on the rest so they get reassigned.
+        for dup in group_sorted[1:]:
+            dup["id"] = None
+            updated = True
+
+    # Assign missing/invalid IDs and normalize IDs to ints.
+    used: Set[int] = set()
+    max_id = 0
+    for conv in conversations:
+        cid = _parse_id(conv.get("id"))
+        if cid is not None:
+            used.add(cid)
+            max_id = max(max_id, cid)
+
+    next_id = max(max_id + 1, int(st.session_state.conversation_counter or 1))
+    for conv in conversations:
+        cid = _parse_id(conv.get("id"))
+        if cid is None:
+            conv["id"] = next_id
+            used.add(next_id)
             next_id += 1
             updated = True
-    if updated or next_id > st.session_state.conversation_counter:
+        else:
+            if conv.get("id") != cid:
+                conv["id"] = cid
+                updated = True
+
+    if next_id != st.session_state.conversation_counter:
         st.session_state.conversation_counter = next_id
+        updated = True
+
+    # Clean up any selection/rename state referencing IDs that no longer exist.
+    existing_ids = {str(conv.get("id")) for conv in conversations}
+    if st.session_state.get("selected_conversations"):
+        filtered = [cid for cid in st.session_state.selected_conversations if str(cid) in existing_ids]
+        if filtered != st.session_state.selected_conversations:
+            st.session_state.selected_conversations = filtered
+            updated = True
+    if st.session_state.get("rename_mode") and str(st.session_state.rename_mode) not in existing_ids:
+        st.session_state.rename_mode = None
+        updated = True
+
+    if updated:
+        save_conversations_to_disk(conversations)
 
 
 def find_conversation_index(conv_id):
@@ -308,6 +370,7 @@ def init_session_state():
         "current_conversation": [],
         "conversation_counter": 1,
         "selected_sources": [],
+        "clear_sources_pending": False,
         "rename_mode": None,  # stores the ID of conversation being renamed
         "typing_indicator": False,
         "conversation_search": "",
@@ -634,12 +697,15 @@ document.addEventListener('keydown', function(e) {
     // Ctrl+K to focus input
     if (e.ctrlKey && e.key === 'k') {
         e.preventDefault();
-        const input = document.querySelector('input[type="text"]');
+        const input = document.querySelector('textarea, input[type="text"]');
         if (input) input.focus();
     }
 
     // Enter in form to submit (handled by browser by default, but ensuring it works)
-    if (e.key === 'Enter' && e.target.tagName === 'INPUT') {
+    if (e.key === 'Enter' && (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA')) {
+        // In textareas: Enter submits; Shift+Enter makes a newline.
+        if (e.target.tagName === 'TEXTAREA' && e.shiftKey) return;
+        if (e.target.tagName === 'TEXTAREA') e.preventDefault();
         const form = e.target.closest('form');
         if (form) {
             const submitBtn = form.querySelector('button[type="submit"]');
@@ -692,6 +758,15 @@ with st.expander("Focus Sources (Optional)", expanded=False):
     st.write("Select specific texts to focus your search:")
     available_sources = list(load_available_sources())
 
+    if st.session_state.clear_sources_pending:
+        st.session_state.selected_sources = []
+        for tradition_texts in TEXT_COLLECTIONS.values():
+            for text in tradition_texts:
+                state_key = f"source_{text}"
+                if state_key in st.session_state:
+                    st.session_state[state_key] = False
+        st.session_state.clear_sources_pending = False
+
     # Group sources by tradition for easier selection
     col1, col2 = st.columns(2)
 
@@ -720,7 +795,7 @@ with st.expander("Focus Sources (Optional)", expanded=False):
     if st.session_state.selected_sources:
         st.write(f"**Selected sources:** {', '.join(st.session_state.selected_sources)}")
         if st.button("Clear All", key="clear_sources"):
-            st.session_state.selected_sources = []
+            st.session_state.clear_sources_pending = True
             st.rerun()
 
     st.caption(f"{len(st.session_state.selected_sources)} selected - {len(available_sources)} available")
@@ -826,10 +901,11 @@ with main_col:
         st.session_state.question_needs_reset = False
 
     with st.form("chat_form", clear_on_submit=True):
-        question = st.text_input(
+        question = st.text_area(
             "Continue the conversation...",
             key="question_input",
             placeholder="Ask a follow-up question or start a new topic",
+            height=90,
         )
         submitted = st.form_submit_button("Send")
 

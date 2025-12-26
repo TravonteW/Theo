@@ -3,3 +3,5 @@ chunks.pkl
 citations.json
 conversations.json
 index.faiss
+__pycache__/
+*.pyc

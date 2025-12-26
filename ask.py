@@ -91,6 +91,58 @@ def _collect_contexts_from_indices(indices: np.ndarray, citation_map: Dict[str, 
     return results
 
 
+def _collect_diverse_contexts_from_indices(
+    indices: np.ndarray,
+    citation_map: Dict[str, Dict],
+    limit: int,
+    per_source_k: int,
+    allowed_sources: Optional[Set[str]] = None,
+) -> List[Dict]:
+    results: List[Dict] = []
+    seen: Set[str] = set()
+    per_source_counts: Dict[str, int] = {}
+
+    def _add(chunk_id: str, info: Dict):
+        results.append({
+            "id": chunk_id,
+            "source_pdf": info["source_pdf"],
+            "page_num": info["page_num"],
+            "text": info["text"],
+        })
+        seen.add(chunk_id)
+        per_source_counts[info["source_pdf"]] = per_source_counts.get(info["source_pdf"], 0) + 1
+
+    # First pass: enforce per-source cap to encourage source diversity.
+    for idx in indices[0]:
+        chunk_id = str(int(idx))
+        if chunk_id in seen or chunk_id not in citation_map:
+            continue
+        info = citation_map[chunk_id]
+        source = info["source_pdf"]
+        if allowed_sources and source not in allowed_sources:
+            continue
+        if per_source_counts.get(source, 0) >= per_source_k:
+            continue
+        _add(chunk_id, info)
+        if len(results) >= limit:
+            return results
+
+    # Second pass: top up ignoring per-source cap (still de-duping).
+    for idx in indices[0]:
+        chunk_id = str(int(idx))
+        if chunk_id in seen or chunk_id not in citation_map:
+            continue
+        info = citation_map[chunk_id]
+        source = info["source_pdf"]
+        if allowed_sources and source not in allowed_sources:
+            continue
+        _add(chunk_id, info)
+        if len(results) >= limit:
+            break
+
+    return results
+
+
 def retrieve_similar_chunks(
     question_embedding: List[float],
     index: faiss.Index,
@@ -202,17 +254,27 @@ def retrieve_multi_source_contexts(
 
     if not targets:
         qe = get_embedding(question)
-        chunks = retrieve_similar_chunks(qe, index, citation_map, k=min(k_total, 5))
-        if matched_focus:
-            allowed_norm = {_normalize_source_name(src) for src in matched_focus}
-            filtered = [c for c in chunks if _normalize_source_name(c["source_pdf"]) in allowed_norm]
-            if filtered:
-                return filtered
-        return chunks
+        qv = np.array([qe]).astype('float32')
+        _, inds = index.search(qv, max(breadth, k_total * 60))
+        diverse = _collect_diverse_contexts_from_indices(
+            inds,
+            citation_map,
+            limit=k_total,
+            per_source_k=max(1, per_source_k),
+            allowed_sources=allowed_sources,
+        )
+        return diverse
 
     if not forced_mode and len(targets) < 2:
         qe = get_embedding(question)
-        return retrieve_similar_chunks(qe, index, citation_map, k=min(k_total, 5))
+        qv = np.array([qe]).astype('float32')
+        _, inds = index.search(qv, max(breadth, k_total * 60))
+        return _collect_diverse_contexts_from_indices(
+            inds,
+            citation_map,
+            limit=min(k_total, 12),
+            per_source_k=max(1, min(per_source_k, 3)),
+        )
 
     collected: List[Dict] = []
     used_ids: Set[str] = set()
@@ -321,32 +383,37 @@ def create_prompt_with_context(question: str, contexts: List[Dict], history: Opt
     multi_source = len({c["source_pdf"] for c in contexts}) > 1
     num_contexts = len(contexts)
     base_instructions = (
-        "You are Theo, a precise theological research assistant. "
-        "Rely exclusively on the supplied passages (including any prior turns the user already saw); never invent details. "
-        f"CRITICAL: Only use citation numbers [1] through [{num_contexts}]. Never invent citation numbers beyond this range. "
-        "Structure EVERY reply with this exact format:\n"
-        "\n**Answer**\n"
-        "[A concise paragraph directly addressing the question with inline citations like [1], [2]]\n"
-        "\n**Supporting Points**\n"
-        "- [First key point or claim] [citation]\n"
-        "- [Second key point or claim] [citation]\n"
-        "[Continue as needed, each bullet ending with citation(s)]\n"
-        "\n**Tensions/Gaps** (include only when sources conflict or gaps exist)\n"
-        "[Brief explanation of disagreements or missing information with citations]\n"
-        "\nDo not mention limitations, training data, or the retrieval process."
+        "You are Theo, a theological assistant specializing in Christianity, Islam, Buddhism, Hinduism, and Judaism. "
+        "Your goal is to help users understand and explore religious and sacred texts from these traditions.\n\n"
+        "Use the supplied passages (and any prior turns the user already saw) as your evidence. Do not invent details. "
+        f"CRITICAL: Cite using only citation numbers [1] through [{num_contexts}]. Never invent citation numbers beyond this range.\n\n"
+        "Citations:\n"
+        "- Cite specific passages for complete context, using inline citations like [1] or [2][3].\n"
+        "- If you make a claim, support it with a citation whenever the passages support it.\n\n"
+        "Semantics and phrasing:\n"
+        "- If the user's wording differs from the passages, map their terms to the closest concepts in the text (synonyms, paraphrases, related terms).\n"
+        "- Avoid saying an idea is \"not in the text\" when the passages express it using different words; instead explain the connection and cite it.\n\n"
+        "Hypotheticals and application:\n"
+        "- If the user asks a hypothetical or how a principle applies to a scenario not explicitly described, first ground the answer in the passages (cite the relevant principles), "
+        "then provide a careful, clearly-labeled interpretation or application that follows from those principles.\n"
+        "- If the passages do not support the requested detail, say so plainly and ask a clarifying question or offer the closest supported framing.\n\n"
+        "Interpretation:\n"
+        "- When content is ambiguous or interpretive, provide a balanced view acknowledging different perspectives that are consistent with the passages.\n"
+        "- Maintain a respectful tone toward diverse beliefs and interpretations.\n\n"
+        "Do not mention limitations, training data, or the retrieval process."
     )
 
     casual_instructions = (
-        " The user sounds conversational or is asking for a quick take. Keep the Answer section under roughly 120 words, use a warm, plainspoken tone, "
-        "and limit Supporting Points to the one or two clearest facts. Include Tensions/Gaps only when the sources make a contradiction explicit."
+        " The user sounds conversational or is asking for a quick take. Keep the response concise (roughly 120-180 words unless asked otherwise), "
+        "use a warm, plainspoken tone, and include only the most helpful citations."
     )
     research_instructions = (
-        " The user is seeking a thorough or comparative explanation. Maintain an analytical tone, expand Supporting Points with every salient citation, "
-        "and always include Tensions/Gaps whenever the sources disagree or omit requested details."
+        " The user is seeking a thorough or comparative explanation. Maintain an analytical tone, expand on key points with citations, "
+        "and explicitly note meaningful disagreements or gaps when the passages conflict or do not address the user's request."
     )
     style_instructions = casual_instructions if response_style == "casual" else research_instructions
     compare_instructions = (
-        " When multiple distinct sources are provided, ensure your Supporting Points section includes comparisons between sources, "
+        " When multiple distinct sources are provided, explicitly compare them where relevant, "
         "highlighting both agreements and differences with proper citations."
     )
     system_message = {
@@ -380,22 +447,38 @@ def create_prompt_with_context(question: str, contexts: List[Dict], history: Opt
     return messages
 
 
-def get_completion(messages: List[Dict], model: str = "gpt-5-mini", fallback_model: str = "gpt-5") -> str:
+def get_completion(
+    messages: List[Dict],
+    model: str = "gpt-5-mini",
+    fallback_model: str = "gpt-5.2",
+    reasoning_effort: Optional[str] = None,
+    text_verbosity: Optional[str] = None,
+) -> str:
     """Get a completion from the OpenAI API."""
     client = OpenAI()
+
+    reasoning_effort = reasoning_effort or os.getenv("THEO_REASONING_EFFORT", "medium")
+    text_verbosity = text_verbosity or os.getenv("THEO_TEXT_VERBOSITY", "medium")
+
+    def _create_chat_completion(model_name: str):
+        kwargs = {
+            "model": model_name,
+            "messages": messages,
+            "reasoning": {"effort": reasoning_effort},
+            "text": {"verbosity": text_verbosity},
+        }
+        try:
+            return client.chat.completions.create(**kwargs)
+        except TypeError:
+            # Back-compat for older SDKs that don't accept GPT-5 controls yet.
+            return client.chat.completions.create(model=model_name, messages=messages)
     
     try:
-        response = client.chat.completions.create(
-            model=model,
-            messages=messages
-        )
+        response = _create_chat_completion(model)
         return response.choices[0].message.content
     except Exception as e:
         print(f"Error with {model}, falling back to {fallback_model}: {e}")
-        response = client.chat.completions.create(
-            model=fallback_model,
-            messages=messages
-        )
+        response = _create_chat_completion(fallback_model)
         return response.choices[0].message.content
 
 
@@ -519,13 +602,54 @@ def extract_citations(answer: str, contexts: List[Dict]) -> Dict:
     return result
 
 
+def _count_unique_citations(answer_text: str) -> int:
+    import re
+    nums = set(int(match) for match in re.findall(r"\[(\d+)\]", answer_text))
+    return len(nums)
+
+
+def _answer_suggests_more_context(answer_text: str) -> bool:
+    text = answer_text.lower()
+    triggers = (
+        "not addressed",
+        "not mentioned",
+        "not in the text",
+        "not in the passages",
+        "insufficient",
+        "not enough information",
+        "cannot determine",
+        "can't determine",
+        "unclear from the passages",
+    )
+    return any(t in text for t in triggers)
+
+
 def answer(question: str, conversation: Optional[List[Dict[str, str]]] = None, focus_sources: Optional[List[str]] = None) -> Dict:
     """Answer a question with cited sources."""
     # Load resources
     index, citation_map = load_resources()
     
+    response_style = determine_response_style(question)
+    if focus_sources:
+        k_total, per_source_k, breadth = 8, 3, 200
+    else:
+        is_long = len(question.split()) >= 18
+        is_comparative = any(k in question.lower() for k in ("compare", "contrast", "difference", "differences", "across", "versus", "vs"))
+        if response_style == "research" or is_long or is_comparative:
+            k_total, per_source_k, breadth = 12, 3, 450
+        else:
+            k_total, per_source_k, breadth = 10, 2, 320
+
     # Retrieve contexts, ensuring multi-source coverage when applicable
-    raw_contexts = retrieve_multi_source_contexts(question, index, citation_map, k_total=8, per_source_k=3, focus_sources=focus_sources)
+    raw_contexts = retrieve_multi_source_contexts(
+        question,
+        index,
+        citation_map,
+        k_total=k_total,
+        per_source_k=per_source_k,
+        breadth=breadth,
+        focus_sources=focus_sources,
+    )
 
     # Apply chunk de-duplication and page-window stitching
     contexts = deduplicate_and_stitch_chunks(raw_contexts)
@@ -535,6 +659,28 @@ def answer(question: str, conversation: Optional[List[Dict[str, str]]] = None, f
     
     # Get completion
     answer_text = get_completion(messages)
+
+    # If no specific sources were selected, allow the model to "pull wider" when needed:
+    # if the answer has too few citations or signals missing context, re-run once with a broader retrieval.
+    if not focus_sources:
+        citation_count = _count_unique_citations(answer_text)
+        if citation_count < 2 or _answer_suggests_more_context(answer_text):
+            raw_contexts_wide = retrieve_multi_source_contexts(
+                question,
+                index,
+                citation_map,
+                k_total=max(k_total, 16),
+                per_source_k=max(per_source_k, 3),
+                breadth=max(breadth, 700),
+                focus_sources=None,
+            )
+            contexts_wide = deduplicate_and_stitch_chunks(raw_contexts_wide)
+            if len(contexts_wide) > len(contexts):
+                messages_wide = create_prompt_with_context(question, contexts_wide, history=conversation)
+                answer_text_wide = get_completion(messages_wide)
+                if _count_unique_citations(answer_text_wide) >= citation_count:
+                    contexts = contexts_wide
+                    answer_text = answer_text_wide
     
     # Extract and format citations
     result = extract_citations(answer_text, contexts)
