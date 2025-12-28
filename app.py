@@ -4,6 +4,7 @@ Streamlit web interface for the PDF Q&A system.
 """
 
 import base64
+import os
 import streamlit as st
 import json
 import textwrap
