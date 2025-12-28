@@ -23,6 +23,28 @@ This application allows users to ask questions about a collection of PDF documen
    export OPENAI_API_KEY=your-api-key
    ```
 
+### Streamlit Community Cloud deployment
+
+- Do not commit secrets. This repo now ignores `.env` and `.streamlit/secrets.toml`.
+- In Streamlit Cloud, set `OPENAI_API_KEY` in the app's Secrets (Advanced settings) or create a local `.streamlit/secrets.toml` during development.
+  Example secrets:
+  ```toml
+  OPENAI_API_KEY = "your-api-key"
+  THEO_REASONING_EFFORT = "medium"
+  THEO_TEXT_VERBOSITY = "medium"
+  # Recommended for public deployments (prevents cross-user conversation leakage):
+  THEO_PERSIST_CONVERSATIONS = "0"
+  ```
+
+### Local development
+
+- Copy `.env.example` to `.env` and fill in `OPENAI_API_KEY`.
+
+## Security notes
+
+- If an API key was ever committed to Git, treat it as compromised: rotate it in your OpenAI dashboard and rewrite Git history before publishing.
+- By default, this app does not save conversations to disk. To enable local persistence, set `THEO_PERSIST_CONVERSATIONS=1`.
+
 ## Usage
 
 1. Process your PDF files:

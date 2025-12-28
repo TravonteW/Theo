@@ -77,6 +77,16 @@ TYPING_HTML = """
 </div>
 """
 
+
+def disk_persistence_enabled() -> bool:
+    """Controls whether conversations are saved/loaded from conversations.json.
+
+    WARNING: In a public Streamlit deployment, disk persistence can mix different users'
+    conversations on the server. Keep disabled unless you understand the privacy impact.
+    """
+    value = str(os.getenv("THEO_PERSIST_CONVERSATIONS", "")).strip().lower()
+    return value in {"1", "true", "yes", "on"}
+
 def format_title(name: str) -> str:
     return name.removesuffix(".pdf")
 
@@ -267,10 +277,10 @@ def format_timestamp(timestamp: str | None) -> str:
         return timestamp or ""
 
 
-def run_answer_flow(question: str, add_question: bool = True, focus_sources=None):
+def run_answer_flow(question: str, add_question: bool = True, focus_sources=None) -> bool:
     """Shared helper to call the backend, append messages, and keep metadata."""
     if not question:
-        return
+        return False
     ensure_active_conversation()
 
     history_messages = []
@@ -285,8 +295,11 @@ def run_answer_flow(question: str, add_question: bool = True, focus_sources=None
         result = answer(question, conversation=history_messages, focus_sources=focus)
         st.session_state.last_error = None
     except Exception as exc:
-        st.session_state.last_error = str(exc)
-        raise
+        debug = str(os.getenv("THEO_DEBUG", "")).strip().lower() in {"1", "true", "yes", "on"}
+        st.session_state.last_error = f"{type(exc).__name__}: {exc}" if debug else "Theo hit an error generating a reply. Please try again."
+        if debug:
+            raise
+        return False
 
     if add_question:
         st.session_state.current_conversation.append(create_message("question", question))
@@ -295,6 +308,7 @@ def run_answer_flow(question: str, add_question: bool = True, focus_sources=None
         create_message("answer", result["answer"], result.get("citations", []), source_question=question)
     )
     persist_current_conversation()
+    return True
 
 def make_citations_clickable(text: str, answer_counter: int) -> str:
     """Convert citation numbers [1], [2] etc into clickable chips that scroll to citation cards"""
@@ -337,6 +351,9 @@ def generate_conversation_title(conversation):
 
 def save_conversations_to_disk(conversations, max_conversations=MAX_CONVERSATIONS):
     """Save conversations to disk with size cap and rotation"""
+    if not disk_persistence_enabled():
+        return
+
     # Add timestamp to conversations if not present
     for conv in conversations:
         if 'timestamp' not in conv:
@@ -354,6 +371,8 @@ def save_conversations_to_disk(conversations, max_conversations=MAX_CONVERSATION
 
 def load_conversations_from_disk():
     """Load conversations from disk"""
+    if not disk_persistence_enabled():
+        return []
     try:
         with open('conversations.json', 'r', encoding='utf-8') as f:
             return json.load(f)
@@ -856,10 +875,11 @@ with main_col:
                                 prior_question = msg.get("source_question")
                                 if not prior_question and idx > 0 and conversation[idx - 1]["type"] == "question":
                                     prior_question = conversation[idx - 1]["content"]
-                                run_answer_flow(prior_question or "", add_question=False)
+                                regen_ok = run_answer_flow(prior_question or "", add_question=False)
                             finally:
                                 regen_placeholder.empty()
-                            st.rerun()
+                            if regen_ok:
+                                st.rerun()
                     else:
                         st.caption("Regenerate latest answer only")
 
@@ -871,7 +891,7 @@ with main_col:
                             display_name = format_title(citation["pdf"])
                             citation_id = f"citation-{answer_counter}-{label}"
                             citation_text_raw = f"{display_name}, Page {citation['page']}"
-                            safe_citation_js = safe_js_text(citation_text_raw)
+                            citation_payload = encode_copy_payload(citation_text_raw)
                             st.markdown(
                                 f"""
                                 <div class='citation-card' id='{sanitize_html(citation_id)}'>
@@ -880,7 +900,7 @@ with main_col:
                                         <p class='citation-title'>{sanitize_html(display_name)} - Page {sanitize_html(str(citation['page']))}</p>
                                         <p class='citation-snippet'>{sanitize_html(citation['snippet'])}</p>
                                         <div class='copy-buttons'>
-                                            <button class='copy-btn' onclick='navigator.clipboard.writeText("{safe_citation_js}")'>Copy Citation</button>
+                                            <button class='copy-btn' data-copy-b64='{citation_payload}'>Copy Citation</button>
                                         </div>
                                     </div>
                                 </div>
@@ -914,11 +934,12 @@ with main_col:
         typing_placeholder.markdown(TYPING_HTML, unsafe_allow_html=True)
         with st.spinner("Theo is composing a reply..."):
             try:
-                run_answer_flow(question)
+                submit_ok = run_answer_flow(question)
             finally:
                 typing_placeholder.empty()
-        st.session_state.question_needs_reset = True
-        st.rerun()
+        if submit_ok:
+            st.session_state.question_needs_reset = True
+            st.rerun()
 
 auto_scroll_flag = "true" if st.session_state.user_settings.get("auto_scroll", True) else "false"
 st.markdown(
@@ -932,7 +953,7 @@ st.markdown(
                 if (bottom) bottom.scrollIntoView({{behavior: 'smooth', block: 'end'}});
             }}, 120);
         }}
-        document.querySelectorAll('.action-btn.copy').forEach(btn => {{
+        document.querySelectorAll('button[data-copy-b64]').forEach(btn => {{
             btn.addEventListener('click', () => {{
                 const payload = btn.getAttribute('data-copy-b64');
                 if (payload) {{

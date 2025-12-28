@@ -5,3 +5,9 @@ conversations.json
 index.faiss
 __pycache__/
 *.pyc
+.env
+.env.*
+!.env.example
+.streamlit/secrets.toml
+.vscode/
+.claude/

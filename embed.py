@@ -20,6 +20,31 @@ import faiss
 from openai import OpenAI
 
 
+def _hydrate_openai_env_from_streamlit_secrets() -> None:
+    if os.getenv("OPENAI_API_KEY"):
+        return
+    try:
+        import streamlit as st  # type: ignore
+    except Exception:
+        return
+
+    api_key = None
+    try:
+        api_key = st.secrets.get("OPENAI_API_KEY")
+    except Exception:
+        api_key = None
+
+    if not api_key:
+        try:
+            openai_section = st.secrets.get("openai") or {}
+            api_key = openai_section.get("api_key")
+        except Exception:
+            api_key = None
+
+    if api_key:
+        os.environ["OPENAI_API_KEY"] = str(api_key)
+
+
 def load_chunks(input_file: str = "chunks.pkl") -> List[Dict]:
     """Load chunks from a pickle file."""
     if not os.path.exists(input_file):
@@ -31,6 +56,7 @@ def load_chunks(input_file: str = "chunks.pkl") -> List[Dict]:
 
 def get_embeddings(texts: List[str], model: str = "text-embedding-3-small") -> List[List[float]]:
     """Generate embeddings for texts using OpenAI's embedding model."""
+    _hydrate_openai_env_from_streamlit_secrets()
     client = OpenAI()
     embeddings = []
     

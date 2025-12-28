@@ -22,6 +22,37 @@ _cached_index = None
 _cached_citation_map = None
 _cache_timestamps = {}
 
+
+def _hydrate_openai_env_from_streamlit_secrets() -> None:
+    """Load OPENAI_API_KEY from Streamlit secrets when env vars are not set."""
+    if os.getenv("OPENAI_API_KEY"):
+        return
+    try:
+        import streamlit as st  # type: ignore
+    except Exception:
+        return
+
+    api_key = None
+    try:
+        api_key = st.secrets.get("OPENAI_API_KEY")
+    except Exception:
+        api_key = None
+
+    if not api_key:
+        try:
+            openai_section = st.secrets.get("openai") or {}
+            api_key = openai_section.get("api_key")
+        except Exception:
+            api_key = None
+
+    if api_key:
+        os.environ["OPENAI_API_KEY"] = str(api_key)
+
+
+def _openai_client() -> OpenAI:
+    _hydrate_openai_env_from_streamlit_secrets()
+    return OpenAI()
+
 def _normalize_source_name(name: str) -> str:
     return Path(name).stem.replace("_", " ").lower().strip()
 
@@ -64,7 +95,7 @@ def load_resources() -> Tuple[faiss.Index, Dict[str, Dict]]:
 
 def get_embedding(text: str, model: str = "text-embedding-3-small") -> List[float]:
     """Generate embedding for a single text using OpenAI's embedding model."""
-    client = OpenAI()
+    client = _openai_client()
     response = client.embeddings.create(
         model=model,
         input=[text]
@@ -455,7 +486,7 @@ def get_completion(
     text_verbosity: Optional[str] = None,
 ) -> str:
     """Get a completion from the OpenAI API."""
-    client = OpenAI()
+    client = _openai_client()
 
     reasoning_effort = reasoning_effort or os.getenv("THEO_REASONING_EFFORT", "medium")
     text_verbosity = text_verbosity or os.getenv("THEO_TEXT_VERBOSITY", "medium")
