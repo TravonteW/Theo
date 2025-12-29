@@ -418,14 +418,29 @@ def init_session_state():
 
 @st.cache_data
 def load_available_sources():
-    with Path("citations.json").open("r", encoding="utf-8") as fh:
-        data = json.load(fh)
-    lookup = {}
-    for info in data.values():
-        original = info["source_pdf"]
-        normalized = normalize_title(original)
-        lookup[normalized] = original
-    return lookup
+    """Return a mapping of normalized source names -> original source name.
+
+    In Streamlit Cloud (or fresh checkouts), `citations.json` may not exist yet.
+    In that case we fall back to the curated `TEXT_COLLECTIONS` list so the UI
+    can render without crashing.
+    """
+    citations_path = Path("citations.json")
+    if citations_path.exists():
+        with citations_path.open("r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        lookup: Dict[str, str] = {}
+        for info in data.values():
+            original = info["source_pdf"]
+            normalized = normalize_title(original)
+            lookup[normalized] = original
+        return lookup
+
+    fallback: Dict[str, str] = {}
+    for tradition_texts in TEXT_COLLECTIONS.values():
+        for title in tradition_texts:
+            normalized = normalize_title(title)
+            fallback.setdefault(normalized, title)
+    return fallback
 
 # Set page configuration
 st.set_page_config(
