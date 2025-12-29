@@ -85,7 +85,11 @@ def disk_persistence_enabled() -> bool:
     WARNING: In a public Streamlit deployment, disk persistence can mix different users'
     conversations on the server. Keep disabled unless you understand the privacy impact.
     """
-    value = str(os.getenv("THEO_PERSIST_CONVERSATIONS", "")).strip().lower()
+    # Local import as a belt-and-suspenders guard for deploy environments where
+    # module-level imports may have been altered during hot reloads.
+    import os as _os
+
+    value = str(_os.getenv("THEO_PERSIST_CONVERSATIONS", "")).strip().lower()
     return value in {"1", "true", "yes", "on"}
 
 def format_title(name: str) -> str:
