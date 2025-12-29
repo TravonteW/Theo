@@ -17,7 +17,7 @@ from dotenv import load_dotenv
 # Load environment variables from .env file
 load_dotenv()
 
-from ask import answer
+from ask import answer, get_asset_path
 
 # Text collections organized by religious tradition
 TEXT_COLLECTIONS = {
@@ -301,7 +301,17 @@ def run_answer_flow(question: str, add_question: bool = True, focus_sources=None
         st.session_state.last_error = None
     except Exception as exc:
         debug = str(os.getenv("THEO_DEBUG", "")).strip().lower() in {"1", "true", "yes", "on"}
-        st.session_state.last_error = f"{type(exc).__name__}: {exc}" if debug else "Theo hit an error generating a reply. Please try again."
+        missing_assets = (
+            isinstance(exc, FileNotFoundError)
+            and ("index.faiss" in str(exc) or "citations.json" in str(exc))
+        )
+        friendly = (
+            "Theo is missing its retrieval files (`index.faiss` / `citations.json`). "
+            "Generate them locally (run `embed.py`), then host them and set "
+            "`THEO_ASSET_BUNDLE_URL` (or `THEO_INDEX_URL` + `THEO_CITATIONS_URL`) in Streamlit Secrets, "
+            "then reboot the app."
+        )
+        st.session_state.last_error = f"{type(exc).__name__}: {exc}" if debug else (friendly if missing_assets else "Theo hit an error generating a reply. Please try again.")
         if debug:
             raise
         return False
@@ -424,8 +434,8 @@ def load_available_sources():
     In that case we fall back to the curated `TEXT_COLLECTIONS` list so the UI
     can render without crashing.
     """
-    citations_path = Path("citations.json")
-    if citations_path.exists():
+    citations_path = get_asset_path("citations.json")
+    try:
         with citations_path.open("r", encoding="utf-8") as fh:
             data = json.load(fh)
         lookup: Dict[str, str] = {}
@@ -434,6 +444,11 @@ def load_available_sources():
             normalized = normalize_title(original)
             lookup[normalized] = original
         return lookup
+    except FileNotFoundError:
+        pass
+    except Exception:
+        # If the file is present but unreadable, fall back to curated titles.
+        pass
 
     fallback: Dict[str, str] = {}
     for tradition_texts in TEXT_COLLECTIONS.values():

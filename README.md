@@ -27,6 +27,7 @@ This application allows users to ask questions about a collection of PDF documen
 
 - Do not commit secrets. This repo now ignores `.env` and `.streamlit/secrets.toml`.
 - In Streamlit Cloud, set `OPENAI_API_KEY` in the app's Secrets (Advanced settings) or create a local `.streamlit/secrets.toml` during development.
+- This app also requires retrieval artifacts (`index.faiss` and `citations.json`). If you don't commit them to the repo, host them externally and provide a download URL via Secrets.
   Example secrets:
   ```toml
   OPENAI_API_KEY = "your-api-key"
@@ -34,6 +35,8 @@ This application allows users to ask questions about a collection of PDF documen
   THEO_TEXT_VERBOSITY = "medium"
   # Recommended for public deployments (prevents cross-user conversation leakage):
   THEO_PERSIST_CONVERSATIONS = "0"
+  # Optional: auto-download retrieval artifacts from a zip containing `index.faiss` + `citations.json`:
+  # THEO_ASSET_BUNDLE_URL = "https://host/path/theo_assets.zip"
   ```
 
 ### Local development

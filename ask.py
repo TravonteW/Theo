@@ -5,6 +5,10 @@ Question answering system with cited sources from a collection of PDFs.
 
 import os
 import json
+import shutil
+import tempfile
+import urllib.request
+import zipfile
 import faiss
 import numpy as np
 from pathlib import Path
@@ -21,6 +25,120 @@ from openai import OpenAI
 _cached_index = None
 _cached_citation_map = None
 _cache_timestamps = {}
+
+
+def _get_streamlit_secrets():
+    try:
+        import streamlit as st  # type: ignore
+    except Exception:
+        return None
+    try:
+        return st.secrets
+    except Exception:
+        return None
+
+
+def _get_theo_setting(key: str, default: Optional[str] = None) -> Optional[str]:
+    value = os.getenv(key)
+    if value is not None and str(value).strip() != "":
+        return value
+
+    secrets = _get_streamlit_secrets()
+    if secrets is None:
+        return default
+
+    try:
+        if key in secrets:
+            return str(secrets[key])
+    except Exception:
+        pass
+
+    try:
+        value = secrets.get(key)
+        if value is not None and str(value).strip() != "":
+            return str(value)
+    except Exception:
+        pass
+
+    return default
+
+
+def _get_asset_dir() -> Path:
+    configured_dir = _get_theo_setting("THEO_ASSET_DIR")
+    if configured_dir:
+        base = Path(str(configured_dir)).expanduser()
+    else:
+        xdg_cache = os.getenv("XDG_CACHE_HOME")
+        base = Path(xdg_cache) / "theo" if xdg_cache else (Path.home() / ".cache" / "theo")
+
+    try:
+        base.mkdir(parents=True, exist_ok=True)
+        return base
+    except Exception:
+        fallback = Path(tempfile.gettempdir()) / "theo"
+        fallback.mkdir(parents=True, exist_ok=True)
+        return fallback
+
+
+def get_asset_path(filename: str) -> Path:
+    """Resolve an asset path from CWD first, then THEO_ASSET_DIR cache."""
+    local = Path(filename)
+    if local.exists():
+        return local
+    return _get_asset_dir() / filename
+
+
+def _download_file(url: str, dest_path: Path) -> None:
+    dest_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = dest_path.with_suffix(dest_path.suffix + ".tmp")
+    with urllib.request.urlopen(url) as resp, tmp_path.open("wb") as fh:
+        shutil.copyfileobj(resp, fh)
+    tmp_path.replace(dest_path)
+
+
+def _download_and_extract_zip(url: str, dest_dir: Path) -> None:
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    zip_path = dest_dir / "theo_assets.zip"
+    _download_file(url, zip_path)
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        zf.extractall(dest_dir)
+    try:
+        zip_path.unlink()
+    except Exception:
+        pass
+
+
+def ensure_retrieval_assets() -> Tuple[Path, Path]:
+    """Ensure index.faiss and citations.json are present, downloading if configured."""
+    index_path = get_asset_path("index.faiss")
+    citations_path = get_asset_path("citations.json")
+    if index_path.exists() and citations_path.exists():
+        return index_path, citations_path
+
+    asset_dir = _get_asset_dir()
+    bundle_url = _get_theo_setting("THEO_ASSET_BUNDLE_URL") or _get_theo_setting("THEO_ASSET_ZIP_URL")
+    if bundle_url:
+        _download_and_extract_zip(str(bundle_url), asset_dir)
+    else:
+        # Optional: allow separate URLs for each artifact.
+        index_url = _get_theo_setting("THEO_INDEX_URL")
+        citations_url = _get_theo_setting("THEO_CITATIONS_URL")
+        if index_url and not Path("index.faiss").exists() and not (asset_dir / "index.faiss").exists():
+            _download_file(str(index_url), asset_dir / "index.faiss")
+        if citations_url and not Path("citations.json").exists() and not (asset_dir / "citations.json").exists():
+            _download_file(str(citations_url), asset_dir / "citations.json")
+
+    index_path = get_asset_path("index.faiss")
+    citations_path = get_asset_path("citations.json")
+    if not index_path.exists() or not citations_path.exists():
+        raise FileNotFoundError(
+            "Missing retrieval assets: index.faiss and citations.json. "
+            "Generate them locally (embed.py), then either (a) host them as a zip and set "
+            "THEO_ASSET_BUNDLE_URL in Streamlit secrets, or (b) provide THEO_INDEX_URL and "
+            "THEO_CITATIONS_URL."
+        )
+
+    return index_path, citations_path
 
 
 def _hydrate_openai_env_from_streamlit_secrets() -> None:
@@ -60,35 +178,37 @@ def load_resources() -> Tuple[faiss.Index, Dict[str, Dict]]:
     """Load the FAISS index and citation map with caching."""
     global _cached_index, _cached_citation_map, _cache_timestamps
 
-    # Check if necessary files exist
-    if not os.path.exists("index.faiss") or not os.path.exists("citations.json"):
-        raise FileNotFoundError(
-            "Index or citation map not found. Run embed.py first."
-        )
+    index_path, citations_path = ensure_retrieval_assets()
 
     # Check file modification times
-    index_mtime = os.path.getmtime("index.faiss")
-    citations_mtime = os.path.getmtime("citations.json")
+    index_key = str(index_path.resolve())
+    citations_key = str(citations_path.resolve())
+    index_mtime = index_path.stat().st_mtime
+    citations_mtime = citations_path.stat().st_mtime
 
     # Load from cache if files haven't changed
     if (
         _cached_index is not None
         and _cached_citation_map is not None
-        and _cache_timestamps.get("index.faiss") == index_mtime
-        and _cache_timestamps.get("citations.json") == citations_mtime
+        and _cache_timestamps.get("index_path") == index_key
+        and _cache_timestamps.get("citations_path") == citations_key
+        and _cache_timestamps.get("index_mtime") == index_mtime
+        and _cache_timestamps.get("citations_mtime") == citations_mtime
     ):
         return _cached_index, _cached_citation_map
 
     # Load FAISS index
-    _cached_index = faiss.read_index("index.faiss")
+    _cached_index = faiss.read_index(str(index_path))
 
     # Load citation map
-    with open("citations.json", "r") as f:
+    with citations_path.open("r", encoding="utf-8") as f:
         _cached_citation_map = json.load(f)
 
     # Update cache timestamps
-    _cache_timestamps["index.faiss"] = index_mtime
-    _cache_timestamps["citations.json"] = citations_mtime
+    _cache_timestamps["index_path"] = index_key
+    _cache_timestamps["citations_path"] = citations_key
+    _cache_timestamps["index_mtime"] = index_mtime
+    _cache_timestamps["citations_mtime"] = citations_mtime
 
     return _cached_index, _cached_citation_map
 
@@ -488,8 +608,8 @@ def get_completion(
     """Get a completion from the OpenAI API."""
     client = _openai_client()
 
-    reasoning_effort = reasoning_effort or os.getenv("THEO_REASONING_EFFORT", "medium")
-    text_verbosity = text_verbosity or os.getenv("THEO_TEXT_VERBOSITY", "medium")
+    reasoning_effort = reasoning_effort or _get_theo_setting("THEO_REASONING_EFFORT", "medium")
+    text_verbosity = text_verbosity or _get_theo_setting("THEO_TEXT_VERBOSITY", "medium")
 
     def _create_chat_completion(model_name: str):
         kwargs = {
