@@ -10,7 +10,7 @@ import json
 import html
 import re
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 from dotenv import load_dotenv
 
 # Load environment variables from .env file
@@ -197,7 +197,7 @@ def ensure_active_conversation():
             "id": new_id,
             "title": "New conversation",
             "messages": [],
-            "timestamp": datetime.now().isoformat()
+            "timestamp": datetime.now(timezone.utc).isoformat()
         }
         st.session_state.conversations.append(placeholder)
         st.session_state.active_conversation_id = new_id
@@ -214,7 +214,7 @@ def persist_current_conversation():
         return
     st.session_state.conversations[idx]["messages"] = st.session_state.current_conversation.copy()
     st.session_state.conversations[idx]["title"] = generate_conversation_title(st.session_state.current_conversation)
-    st.session_state.conversations[idx]["timestamp"] = datetime.now().isoformat()
+    st.session_state.conversations[idx]["timestamp"] = datetime.now(timezone.utc).isoformat()
     st.session_state.conversations = st.session_state.conversations[-MAX_CONVERSATIONS:]
     save_conversations_to_disk(st.session_state.conversations)
 
@@ -248,7 +248,7 @@ def create_message(msg_type: str, content: str, citations=None, source_question:
         "type": msg_type,
         "content": content,
         "citations": citations,
-        "timestamp": datetime.now().isoformat(),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
         "source_question": source_question,
     }
 
@@ -272,6 +272,8 @@ def format_timestamp(timestamp: str | None) -> str:
         return ""
     try:
         dt = datetime.fromisoformat(timestamp)
+        if dt.tzinfo is not None:
+            dt = dt.astimezone(timezone.utc)
         return dt.strftime("%b %d - %H:%M")
     except ValueError:
         return timestamp or ""
@@ -355,7 +357,7 @@ def save_conversations_to_disk(conversations, max_conversations=MAX_CONVERSATION
     # Add timestamp to conversations if not present
     for conv in conversations:
         if 'timestamp' not in conv:
-            conv['timestamp'] = datetime.now().isoformat()
+            conv['timestamp'] = datetime.now(timezone.utc).isoformat()
 
     # Sort by timestamp (newest first) and limit to max_conversations
     conversations_sorted = sorted(conversations, key=lambda x: x.get('timestamp', ''), reverse=True)
@@ -470,6 +472,12 @@ st.markdown("""
 
     body, .stMarkdown, .stText, .stTextInput label, .stCaption {
         color: var(--text-color) !important;
+    }
+
+    .conv-meta {
+        font-size: 0.85rem;
+        color: var(--text-muted);
+        margin: -0.25rem 0 0.9rem;
     }
 
     .stApp > main .block-container {
@@ -852,7 +860,8 @@ with main_col:
         for idx, msg in enumerate(conversation):
             msg_id = msg.get("id") or f"{msg['type']}-{idx}"
             role = "You" if msg["type"] == "question" else "Theo"
-            timestamp = format_timestamp(msg.get("timestamp")) if settings.get("show_timestamps", True) else ""
+            timestamp_iso = msg.get("timestamp") if settings.get("show_timestamps", True) else ""
+            timestamp = format_timestamp(timestamp_iso) if timestamp_iso else ""
             bubble_class = "user" if msg["type"] == "question" else "assistant"
             body_html = sanitize_html(msg["content"])
 
@@ -862,7 +871,7 @@ with main_col:
 
             meta = f"<span>{role}</span>"
             if timestamp:
-                meta += f"<span>{timestamp}</span>"
+                meta += f"<span class='ts' data-iso='{sanitize_html(str(timestamp_iso))}'>{timestamp}</span>"
 
             st.markdown(
                 f"""
@@ -964,6 +973,55 @@ st.markdown(
     f"""
     <div id="chat-bottom"></div>
     <script>
+        function theoParseIso(iso) {{
+            if (!iso) return null;
+            let value = String(iso);
+            // If the timestamp has no timezone offset, treat it as UTC to avoid server-local drift.
+            if (!(/[zZ]$/.test(value) || /[+-]\\d\\d:\\d\\d$/.test(value))) {{
+                value = value + 'Z';
+            }}
+            const d = new Date(value);
+            if (Number.isNaN(d.getTime())) return null;
+            return d;
+        }}
+
+        function theoFormatTs(date) {{
+            try {{
+                const fmt = new Intl.DateTimeFormat(undefined, {{
+                    month: 'short',
+                    day: '2-digit',
+                    hour: '2-digit',
+                    minute: '2-digit',
+                    hour12: false,
+                }});
+                const parts = fmt.formatToParts(date);
+                const get = (type) => {{
+                    const part = parts.find(p => p.type === type);
+                    return part ? part.value : '';
+                }};
+                const month = get('month');
+                const day = get('day');
+                const hour = get('hour');
+                const minute = get('minute');
+                if (month && day && hour && minute) {{
+                    return `${{month}} ${{day}} - ${{hour}}:${{minute}}`;
+                }}
+            }} catch (e) {{
+                // ignore and fall back
+            }}
+            return date.toLocaleString();
+        }}
+
+        function theoLocalizeTimestamps() {{
+            document.querySelectorAll('.ts[data-iso]').forEach(el => {{
+                const iso = el.getAttribute('data-iso');
+                const d = theoParseIso(iso);
+                if (!d) return;
+                el.textContent = theoFormatTs(d);
+            }});
+        }}
+
+        theoLocalizeTimestamps();
         const autoScrollEnabled = {auto_scroll_flag};
         if (autoScrollEnabled) {{
             setTimeout(() => {{
@@ -971,6 +1029,8 @@ st.markdown(
                 if (bottom) bottom.scrollIntoView({{behavior: 'smooth', block: 'end'}});
             }}, 120);
         }}
+        // Re-run after Streamlit finishes rendering updates.
+        setTimeout(theoLocalizeTimestamps, 200);
         document.querySelectorAll('button[data-copy-b64]').forEach(btn => {{
             btn.addEventListener('click', () => {{
                 const payload = btn.getAttribute('data-copy-b64');
@@ -1023,7 +1083,8 @@ with st.sidebar:
             widget_suffix = f"{base_id}_{idx}"
             conv_key = widget_suffix
             message_total = len(conv.get("messages", []))
-            timestamp_label = format_timestamp(conv.get("timestamp")) or "Unsaved draft"
+            timestamp_iso = conv.get("timestamp")
+            timestamp_label = format_timestamp(timestamp_iso) or "Unsaved draft"
 
             select_key = f"select_{widget_suffix}"
             checked = st.checkbox(
@@ -1039,7 +1100,15 @@ with st.sidebar:
 
             title_text = conv.get('title', 'Conversation') or 'Conversation'
             st.markdown(f"**{sanitize_html(title_text)}**")
-            st.caption(f"{timestamp_label} - {message_total} messages")
+            ts_html = (
+                f"<span class='ts' data-iso='{sanitize_html(str(timestamp_iso))}'>{sanitize_html(timestamp_label)}</span>"
+                if timestamp_iso
+                else sanitize_html(timestamp_label)
+            )
+            st.markdown(
+                f"<div class='conv-meta'>{ts_html} - {message_total} messages</div>",
+                unsafe_allow_html=True,
+            )
 
             if st.session_state.rename_mode == base_id:
                 new_title = st.text_input(
