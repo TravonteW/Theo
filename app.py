@@ -7,7 +7,6 @@ import base64
 import os
 import streamlit as st
 import json
-import textwrap
 import html
 import re
 from pathlib import Path
@@ -103,10 +102,6 @@ def sanitize_html(text: str) -> str:
     return html.escape(text)
 
 
-def safe_js_text(text: str) -> str:
-    return sanitize_html(text).replace('"', '&quot;').replace("'", "&#39;")
-
-
 def encode_copy_payload(text: str) -> str:
     return base64.b64encode(text.encode('utf-8')).decode('ascii')
 
@@ -124,7 +119,7 @@ def ensure_conversation_ids():
     conversations = st.session_state.conversations
 
     # If duplicate IDs exist, keep the "best" conversation on the original ID and re-ID the rest.
-    groups: Dict[int, List[Dict]] = {}
+    groups = {}
     for conv in conversations:
         cid = _parse_id(conv.get("id"))
         if cid is not None:
@@ -134,7 +129,7 @@ def ensure_conversation_ids():
         if len(group) <= 1:
             continue
 
-        def _score(c: Dict):
+        def _score(c):
             messages = c.get("messages") or []
             ts = c.get("timestamp") or ""
             return (len(messages), ts)
@@ -146,7 +141,7 @@ def ensure_conversation_ids():
             updated = True
 
     # Assign missing/invalid IDs and normalize IDs to ints.
-    used: Set[int] = set()
+    used = set()
     max_id = 0
     for conv in conversations:
         cid = _parse_id(conv.get("id"))
@@ -334,18 +329,6 @@ def make_citations_clickable(text: str, answer_counter: int) -> str:
 
     return re.sub(r'\[(\d+)\]', replace_citation, text)
 
-def export_answer_as_markdown(answer_text: str, citations: list) -> str:
-    """Export answer with citations as Markdown format"""
-    markdown = f"# Answer\n\n{answer_text}\n\n## Citations\n\n"
-    for citation in citations:
-        markdown += f"[{citation['index']}] {citation['pdf']}, Page {citation['page']}\n"
-        markdown += f"> {citation['snippet']}\n\n"
-    return markdown
-
-def export_citations_as_json(citations: list) -> str:
-    """Export citations as JSON format"""
-    return json.dumps(citations, indent=2, ensure_ascii=False)
-
 def generate_conversation_title(conversation):
     """Generate AI-friendly conversation titles"""
     questions = [m["content"] for m in conversation if m["type"] == "question"]
@@ -438,7 +421,7 @@ def load_available_sources():
     try:
         with citations_path.open("r", encoding="utf-8") as fh:
             data = json.load(fh)
-        lookup: Dict[str, str] = {}
+        lookup = {}
         for info in data.values():
             original = info["source_pdf"]
             normalized = normalize_title(original)
@@ -450,7 +433,7 @@ def load_available_sources():
         # If the file is present but unreadable, fall back to curated titles.
         pass
 
-    fallback: Dict[str, str] = {}
+    fallback = {}
     for tradition_texts in TEXT_COLLECTIONS.values():
         for title in tradition_texts:
             normalized = normalize_title(title)

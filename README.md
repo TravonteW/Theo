@@ -1,93 +1,80 @@
-# PDF Question Answering System
+# Theo
 
-This application allows users to ask questions about a collection of PDF documents and receive answers with inline citations pointing back to the source material.
+Theo is a theological research assistant that answers questions across a curated library of sacred and philosophical texts. Responses include strict inline citations (e.g. `[1]`, `[2]`) that map back to the exact passages used.
 
-## Features
+## What Theo includes
 
-- Extracts and processes text from PDF files
-- Chunks text into semantically meaningful segments
-- Creates embeddings for efficient semantic search
-- Retrieves relevant passages based on user questions
-- Generates answers with citations to source documents
-- Simple web interface for asking questions
+- Chat-style Streamlit UI with conversation threads
+- Inline citations + citation cards/snippets
+- "Focus Sources" filter to restrict retrieval to selected texts
+- Safe defaults for public deployments (disk persistence is off unless you enable it)
 
-## Setup
+## Quickstart (local)
 
-1. Clone this repository
-2. Install dependencies:
-   ```
+1. Install dependencies:
+   ```bash
    pip install -r requirements.txt
    ```
-3. Set your OpenAI API key as an environment variable:
+2. Set your OpenAI key:
+   - Copy `.env.example` to `.env`
+   - Fill in `OPENAI_API_KEY` (do not commit `.env`)
+3. Put PDFs in `PDF Files/`
+4. Build retrieval artifacts:
+   ```bash
+   python ingest.py
+   python embed.py
    ```
-   export OPENAI_API_KEY=your-api-key
+5. Run Theo:
+   ```bash
+   streamlit run app.py
    ```
 
-### Streamlit Community Cloud deployment
+## Deploy to Streamlit Community Cloud
 
-- Do not commit secrets. This repo now ignores `.env` and `.streamlit/secrets.toml`.
-- In Streamlit Cloud, set `OPENAI_API_KEY` in the app's Secrets (Advanced settings) or create a local `.streamlit/secrets.toml` during development.
-- This app also requires retrieval artifacts (`index.faiss` and `citations.json`). If you don't commit them to the repo, host them externally and provide a download URL via Secrets.
-  Example secrets:
-  ```toml
-  OPENAI_API_KEY = "your-api-key"
-  THEO_REASONING_EFFORT = "medium"
-  THEO_TEXT_VERBOSITY = "medium"
-  # Recommended for public deployments (prevents cross-user conversation leakage):
-  THEO_PERSIST_CONVERSATIONS = "0"
-  # Optional: auto-download retrieval artifacts from a zip containing `index.faiss` + `citations.json`:
-  # THEO_ASSET_BUNDLE_URL = "https://host/path/theo_assets.zip"
-  ```
+Do not commit secrets. This repo ignores `.env` and `.streamlit/secrets.toml`.
 
-### Local development
+Theo also requires retrieval artifacts (`index.faiss` and `citations.json`). Because these can be large, the recommended approach is to host them as a zip and let the app download them at runtime.
 
-- Copy `.env.example` to `.env` and fill in `OPENAI_API_KEY`.
+### Recommended: host an asset bundle zip
+
+1. Generate artifacts locally (run `python ingest.py` then `python embed.py`)
+2. Create `theo_assets.zip` containing `index.faiss` and `citations.json`:
+   - `make assets`
+   - or PowerShell: `Compress-Archive -Path index.faiss,citations.json -DestinationPath theo_assets.zip -Force`
+3. Upload `theo_assets.zip` somewhere Streamlit can fetch (a GitHub Release asset works well)
+4. In Streamlit Cloud -> Settings -> Secrets, set:
+   ```toml
+   OPENAI_API_KEY = "your-api-key"
+   THEO_ASSET_BUNDLE_URL = "https://host/path/theo_assets.zip"
+
+   # Recommended for public deployments (prevents cross-user conversation leakage):
+   THEO_PERSIST_CONVERSATIONS = "0"
+   ```
+5. Reboot the app.
+
+## Settings (env vars / Streamlit Secrets)
+
+- `OPENAI_API_KEY` (required)
+- Retrieval artifacts:
+  - `THEO_ASSET_BUNDLE_URL` (zip containing `index.faiss` + `citations.json`)
+  - or `THEO_INDEX_URL` + `THEO_CITATIONS_URL` (separate files)
+  - `THEO_ASSET_DIR` (optional cache directory for downloads)
+- Deployment/privacy:
+  - `THEO_PERSIST_CONVERSATIONS` (`1` to enable saving `conversations.json`; default is off)
+  - `THEO_DEBUG` (`1` to show full exception details; default is off)
+- Response controls (optional):
+  - `THEO_REASONING_EFFORT`
+  - `THEO_TEXT_VERBOSITY`
 
 ## Security notes
 
-- If an API key was ever committed to Git, treat it as compromised: rotate it in your OpenAI dashboard and rewrite Git history before publishing.
-- By default, this app does not save conversations to disk. To enable local persistence, set `THEO_PERSIST_CONVERSATIONS=1`.
+- If an API key was ever committed to Git, treat it as compromised: rotate it and rewrite Git history before publishing.
+- Disk persistence is disabled by default to avoid cross-user leaks on public deployments.
 
-## Usage
+## Project layout
 
-1. Process your PDF files:
-   ```
-   python ingest.py
-   ```
-   This will scan the `./PDF Files` directory for PDFs, extract text, and save chunks to `chunks.pkl`.
-
-2. Create embeddings and build search index:
-   ```
-   python embed.py
-   ```
-   This will generate embeddings for each text chunk and build a FAISS index.
-
-3. Start the web application:
-   ```
-   python -m streamlit run app.py
-   ```
-   Then open your browser to the URL provided in the terminal.
-
-4. Ask questions through the web interface or use the CLI:
-   ```
-   python ask.py
-   ```
-
-## Rebuilding the Index
-
-If you add new PDFs or want to rebuild the index:
-```
-python ingest.py --rebuild
-python embed.py --rebuild
-```
-
-## File Structure
-
-- `ingest.py` - Processes PDF files into text chunks
-- `embed.py` - Creates embeddings and builds search index
-- `ask.py` - Handles question answering functionality
-- `app.py` - Streamlit web interface
-- `requirements.txt` - Required Python packages
-- `chunks.pkl` - Processed text chunks (generated)
-- `index.faiss` - FAISS vector index (generated)
-- `citations.json` - Mapping for citation lookup (generated)
+- `app.py` - Streamlit web UI (Theo)
+- `ask.py` - Retrieval + prompting + citation extraction
+- `ingest.py` - PDF ingestion -> `chunks.pkl`
+- `embed.py` - Embeddings + index build -> `citations.json` + `index.faiss`
+- `requirements.txt` - Runtime dependencies

@@ -23,21 +23,3 @@ disallow_untyped_defs = false
 ignore_missing_imports = true
 no_implicit_optional = true
 show_error_codes = true
-
-[tool.pytest.ini_options]
-minversion = "7.0"
-addopts = [
-    "--strict-markers",
-    "--strict-config",
-    "--cov=.",
-    "--cov-report=term-missing",
-    "--cov-report=html",
-    "--cov-report=xml"
-]
-testpaths = [
-    "."
-]
-python_files = [
-    "test_*.py",
-    "*_test.py"
-]

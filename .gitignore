@@ -3,6 +3,7 @@ chunks.pkl
 citations.json
 conversations.json
 index.faiss
+theo_assets*.zip
 __pycache__/
 *.pyc
 .env

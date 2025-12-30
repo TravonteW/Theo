@@ -7,8 +7,7 @@ import os
 import json
 import pickle
 import argparse
-from typing import Dict, List, Any
-from pathlib import Path
+from typing import Dict, List
 from dotenv import load_dotenv
 
 # Load environment variables from .env file

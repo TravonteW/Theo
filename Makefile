@@ -1,45 +1,33 @@
-.PHONY: help install install-dev test lint format check clean run
+.PHONY: help install ingest embed build assets run clean
 
 help:
 	@echo "Available commands:"
-	@echo "  install     Install production dependencies"
-	@echo "  install-dev Install development dependencies"
-	@echo "  test        Run all tests"
-	@echo "  lint        Run linting checks"
-	@echo "  format      Format code with black and isort"
-	@echo "  check       Run all quality checks (lint + test)"
-	@echo "  clean       Clean up cache and temp files"
-	@echo "  run         Run the Streamlit app"
+	@echo "  install  Install dependencies"
+	@echo "  ingest   Process PDFs into chunks.pkl"
+	@echo "  embed    Build citations.json + index.faiss"
+	@echo "  build    Rebuild chunks + index"
+	@echo "  assets   Create theo_assets.zip (for Streamlit Cloud)"
+	@echo "  run      Run the Streamlit app"
+	@echo "  clean    Remove generated artifacts"
 
 install:
 	pip install -r requirements.txt
 
-install-dev:
-	pip install -r requirements-dev.txt
-	pre-commit install
+ingest:
+	python ingest.py
 
-test:
-	python -m pytest -v
+embed:
+	python embed.py
 
-lint:
-	flake8 *.py
-	mypy *.py
-	black --check *.py
-	isort --check-only *.py
+build:
+	python ingest.py --rebuild
+	python embed.py --rebuild
 
-format:
-	black *.py
-	isort *.py
-
-check: lint test
-	@echo "All quality checks passed!"
-
-clean:
-	rm -rf __pycache__/
-	rm -rf .pytest_cache/
-	rm -rf .coverage
-	rm -rf htmlcov/
-	rm -rf .mypy_cache/
+assets:
+	python -c "import sys, zipfile; from pathlib import Path; out=Path('theo_assets.zip'); files=['index.faiss','citations.json']; missing=[f for f in files if not Path(f).exists()]; sys.exit('Missing: '+', '.join(missing)) if missing else None; with zipfile.ZipFile(out,'w',compression=zipfile.ZIP_DEFLATED) as zf: [zf.write(f, arcname=Path(f).name) for f in files]; print('Wrote', out)"
 
 run:
 	streamlit run app.py
+
+clean:
+	python -c "import shutil; from pathlib import Path; [Path(p).unlink(missing_ok=True) for p in ['chunks.pkl','citations.json','index.faiss','conversations.json','theo_assets.zip']]; shutil.rmtree('__pycache__', ignore_errors=True)"

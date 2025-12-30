@@ -12,7 +12,7 @@ import zipfile
 import faiss
 import numpy as np
 from pathlib import Path
-from typing import Dict, List, Any, Tuple, Set, Optional
+from typing import Dict, List, Tuple, Set, Optional
 from dotenv import load_dotenv
 
 # Load environment variables from .env file
@@ -223,25 +223,6 @@ def get_embedding(text: str, model: str = "text-embedding-3-small") -> List[floa
     return response.data[0].embedding
 
 
-def _collect_contexts_from_indices(indices: np.ndarray, citation_map: Dict[str, Dict], limit: int) -> List[Dict]:
-    results: List[Dict] = []
-    seen: Set[str] = set()
-    for idx in indices[0]:
-        chunk_id = str(int(idx))
-        if chunk_id in citation_map and chunk_id not in seen:
-            chunk_info = citation_map[chunk_id]
-            results.append({
-                "id": chunk_id,
-                "source_pdf": chunk_info["source_pdf"],
-                "page_num": chunk_info["page_num"],
-                "text": chunk_info["text"],
-            })
-            seen.add(chunk_id)
-            if len(results) >= limit:
-                break
-    return results
-
-
 def _collect_diverse_contexts_from_indices(
     indices: np.ndarray,
     citation_map: Dict[str, Dict],
@@ -292,19 +273,6 @@ def _collect_diverse_contexts_from_indices(
             break
 
     return results
-
-
-def retrieve_similar_chunks(
-    question_embedding: List[float],
-    index: faiss.Index,
-    citation_map: Dict[str, Dict],
-    k: int = 5
-) -> List[Dict]:
-    """Retrieve the k most similar chunks to the question (single-query)."""
-    query_vector = np.array([question_embedding]).astype('float32')
-    distances, indices = index.search(query_vector, max(k, 20))
-    return _collect_contexts_from_indices(indices, citation_map, k)
-
 
 def _available_sources(citation_map: Dict[str, Dict]) -> List[str]:
     return sorted({v["source_pdf"] for v in citation_map.values()})
